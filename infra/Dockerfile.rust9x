@@ -58,10 +58,11 @@ RUN mkdir -p /opt/rust9x/lib/rustlib/src/rust && \
     ls -la /opt/rust9x/lib/rustlib/src/rust/library/backtrace
 
 # Build r9xrsrt (minimal static libcmt.lib replacement, zero external MSVCRT DLL)
-# compiled strictly for Pentium Pro without MMX/SSE/SSE2.
+# compiled strictly for Pentium (i586: no CMOV, no NOPL, no MMX/SSE/SSE2) so it runs
+# on Pentium, Pentium MMX, K6, and Pentium Pro hardware alike.
 RUN git clone --depth 1 https://github.com/rust9x/r9xrsrt.git /opt/r9xrsrt-src && \
     cd /opt/r9xrsrt-src && \
-    RUSTFLAGS="-C target-cpu=pentiumpro -C target-feature=-mmx,-sse,-sse2 -C link-args=/NODEFAULTLIB" \
+    RUSTFLAGS="-C target-cpu=pentium -C target-feature=-mmx,-sse,-sse2 -C link-args=/NODEFAULTLIB" \
     cargo +rust9x build --release --target i586-rust9x-windows-msvc && \
     mkdir -p /opt/r9xrsrt/lib && \
     cp /opt/r9xrsrt-src/target/i586-rust9x-windows-msvc/release/libcmt.lib /opt/r9xrsrt/lib/libcmt.lib && \

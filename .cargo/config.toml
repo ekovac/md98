@@ -1,7 +1,7 @@
 [target.i586-rust9x-windows-msvc]
 linker = "rust-lld"
 rustflags = [
-  "-C", "target-cpu=pentiumpro",
+  "-C", "target-cpu=pentium",
   "-C", "target-feature=-mmx,-sse,-sse2",
   "-C", "target-feature=+crt-static",
   "-Z", "unicows=no",

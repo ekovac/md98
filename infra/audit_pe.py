@@ -23,8 +23,10 @@ except ImportError:
     sys.exit(2)
 
 
-# Forbidden MMX / SSE / SSE2 / SSE3 / AVX mnemonics for Intel Pentium Pro (i686).
+# Forbidden post-Pentium (i686 CMOV/NOPL/FCOMI + MMX/SSE/SSE2/SSE3/AVX) mnemonics
+# so binaries run cleanly on Pentium (i586), Pentium MMX, K6, and Pentium Pro hardware.
 FORBIDDEN_MNEMONIC_PATTERNS = [
+    r"\b(?:cmov\w+|fcmov\w+|fcomi\w*|fucomi\w*|nopl|nopw|sysenter|sysexit|fxsave|fxrstor|rdpmc)\b",
     r"\b(?:emms|femms)\b",
     r"\b(?:movd|movq|packsswb|packssdw|packuswb|punpck\w+|pmaddwd|pmulhw|pmullw)\b",
     r"\b(?:padd\w+|psub\w+|pand|pandn|por|pxor|psll\w+|psrl\w+|psra\w+|pcmpeq\w+|pcmpgt\w+)\b",
