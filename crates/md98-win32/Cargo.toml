@@ -1,0 +1,11 @@
+[package]
+name = "md98-win32"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "md98"
+path = "src/main.rs"
+
+[dependencies]
+md98-core = { path = "../md98-core" }

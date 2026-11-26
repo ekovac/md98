@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/md98-core",
+    "crates/md98-win32",
+    "infra/win98_agent",
+]
+default-members = [
+    "crates/md98-core",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
