@@ -1,0 +1,14 @@
+/target
+/.venv
+/.cargo-cache
+/dist
+/infra/qemu/*.qcow2
+/infra/qemu/*.img
+/infra/qemu/*.iso
+/infra/qemu/*.ppm
+/infra/qemu/*.png
+/infra/qemu/*.sock
+/infra/qemu/*.log
+/infra/qemu/work/
+*.pyc
+__pycache__/

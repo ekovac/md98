@@ -1,0 +1,13 @@
+[target.i586-rust9x-windows-msvc]
+linker = "rust-lld"
+rustflags = [
+  "-C", "target-cpu=pentiumpro",
+  "-C", "target-feature=-mmx,-sse,-sse2",
+  "-C", "target-feature=+crt-static",
+  "-Z", "unicows=no",
+  "-C", "link-arg=/SUBSYSTEM:WINDOWS,4.0",
+  "-C", "link-arg=/OSVERSION:4.0",
+  "-C", "link-arg=/STACK:262144",
+  "-C", "link-arg=/LIBPATH:/opt/r9xrsrt/lib",
+  "-C", "link-arg=/LIBPATH:/opt/winlibs",
+]

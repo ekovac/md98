@@ -1,0 +1,71 @@
+# Pinned Rust9x cross-compilation container for Windows 98 SE (Pentium Pro, i686, no MMX/SSE/SSE2)
+FROM debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUSTUP_HOME=/opt/rustup
+ENV CARGO_HOME=/opt/cargo
+ENV PATH="/opt/cargo/bin:/opt/rust9x/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    xz-utils \
+    git \
+    gcc \
+    libc6-dev \
+    python3 \
+    python3-pefile \
+    binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install minimal rustup + cargo for toolchain management
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain none --profile minimal
+
+# Download and unpack pinned precompiled rust9x Linux x86_64 toolchain
+ARG RUST9X_TAG=rust9x-1.100.0-v2
+RUN mkdir -p /opt/rust9x && \
+    curl -fsSL "https://github.com/rust9x/rust/releases/download/${RUST9X_TAG}/${RUST9X_TAG}-x86_64-unknown-linux-gnu.tar.xz" \
+    | tar -xJf - --strip-components=1 -C /opt/rust9x && \
+    rustup toolchain link rust9x /opt/rust9x && \
+    rustup default rust9x && \
+    rustc +rust9x --version && \
+    cargo +rust9x --version
+
+# Fetch x86 Windows SDK import libraries via xwin and create case-insensitive symlinks
+ARG XWIN_VERSION=0.10.0
+RUN curl -fsSL "https://github.com/Jake-Shadle/xwin/releases/download/${XWIN_VERSION}/xwin-${XWIN_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xzf - --strip-components=1 -C /usr/local/bin "xwin-${XWIN_VERSION}-x86_64-unknown-linux-musl/xwin" && \
+    xwin --accept-license --arch x86 splat --output /opt/xwin && \
+    mkdir -p /opt/winlibs && \
+    for f in /opt/xwin/sdk/lib/um/x86/*.lib /opt/xwin/sdk/lib/um/x86/*.Lib; do \
+        [ -e "$f" ] || continue; \
+        base=$(basename "$f"); \
+        lower=$(echo "$base" | tr 'A-Z' 'a-z'); \
+        upper=$(echo "$base" | tr 'a-z' 'A-Z'); \
+        cp "$f" "/opt/winlibs/$lower"; \
+        ln -sf "$lower" "/opt/winlibs/$upper" || true; \
+    done && \
+    rm -rf /opt/xwin /tmp/.xwin-cache
+
+# Install rust-src for -Zbuild-std from pinned rust9x/rust tag (sparse checkout of library/)
+RUN mkdir -p /opt/rust9x/lib/rustlib/src/rust && \
+    git clone --depth 1 --branch "${RUST9X_TAG}" --filter=blob:none --sparse \
+        https://github.com/rust9x/rust.git /opt/rust9x/lib/rustlib/src/rust && \
+    cd /opt/rust9x/lib/rustlib/src/rust && \
+    git sparse-checkout set --no-cone /library /Cargo.toml /Cargo.lock /.gitmodules && \
+    git submodule update --init --depth 1 library/backtrace && \
+    ls -la /opt/rust9x/lib/rustlib/src/rust/library/backtrace
+
+# Build r9xrsrt (minimal static libcmt.lib replacement, zero external MSVCRT DLL)
+# compiled strictly for Pentium Pro without MMX/SSE/SSE2.
+RUN git clone --depth 1 https://github.com/rust9x/r9xrsrt.git /opt/r9xrsrt-src && \
+    cd /opt/r9xrsrt-src && \
+    RUSTFLAGS="-C target-cpu=pentiumpro -C target-feature=-mmx,-sse,-sse2 -C link-args=/NODEFAULTLIB" \
+    cargo +rust9x build --release --target i586-rust9x-windows-msvc && \
+    mkdir -p /opt/r9xrsrt/lib && \
+    cp /opt/r9xrsrt-src/target/i586-rust9x-windows-msvc/release/libcmt.lib /opt/r9xrsrt/lib/libcmt.lib && \
+    ln -sf libcmt.lib /opt/r9xrsrt/lib/LIBCMT.LIB && \
+    rm -rf /opt/r9xrsrt-src
+
+WORKDIR /work
