@@ -105,9 +105,9 @@ struct AppState {
     save_test_bytes: usize,
 }
 
+/// Convert UTF-8 string to NUL-terminated Windows-1252 (CP1252) bytes for Win32 `*A` APIs.
 fn cstr(s: &str) -> Vec<u8> {
-    let mut v = Vec::with_capacity(s.len() + 1);
-    v.extend_from_slice(s.as_bytes());
+    let mut v = utf8_to_cp1252(s);
     v.push(0);
     v
 }
@@ -124,7 +124,7 @@ fn parse_cli() -> CliOptions {
             len += 1;
         }
         let slice = core::slice::from_raw_parts(p, len);
-        String::from_utf8_lossy(slice).into_owned()
+        cp1252_to_utf8(slice)
     };
 
     // Tokenize honoring double quotes
@@ -1138,7 +1138,7 @@ unsafe extern "system" fn main_wnd_proc(
                     );
                 }
                 IDM_HELP_ABOUT => {
-                    let msg = cstr("md98 — Native GFM Editor & Live Previewer for Windows 98 SE\r\nWritten in Rust (rust9x) for Intel Pentium Pro (40 MB RAM).");
+                    let msg = cstr("md98 - Native GFM Editor & Live Previewer for Windows 98 SE\r\nWritten in Rust (rust9x) for i586 Pentium+ (40 MB RAM).");
                     let cap = cstr("About md98");
                     MessageBoxA(hwnd, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
                 }
