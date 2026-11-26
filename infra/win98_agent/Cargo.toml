@@ -1,0 +1,10 @@
+[package]
+name = "win98_agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "win98_agent"
+path = "src/main.rs"
+
+[dependencies]
