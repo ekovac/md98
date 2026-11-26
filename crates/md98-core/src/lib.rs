@@ -5,10 +5,11 @@ pub mod layout;
 
 pub use cp1252::{cp1252_to_utf8, normalize_to_crlf, normalize_to_lf, utf8_to_cp1252, utf8_to_cp1252_into};
 pub use layout::{
-    layout_markdown, layout_markdown_with_config, rgb, BlockKind, DocumentLayout, DrawOp, FontStyle,
-    LayoutBlock, LayoutConfig, TextMeasurer, COLOR_CODE_BG, COLOR_CODE_BORDER,
-    COLOR_INLINE_CODE_BG, COLOR_LINK, COLOR_MUTED, COLOR_QUOTE_BAR, COLOR_QUOTE_BG, COLOR_RULE,
-    COLOR_TABLE_BORDER, COLOR_TABLE_HEADER_BG, COLOR_TABLE_STRIPE_BG, COLOR_TEXT,
+    layout_markdown, layout_markdown_with_config, layout_markdown_with_theme, rgb, BlockKind,
+    DocumentLayout, DrawOp, FontStyle, LayoutBlock, LayoutConfig, TextMeasurer, ThemePalette,
+    COLOR_CODE_BG, COLOR_CODE_BORDER, COLOR_INLINE_CODE_BG, COLOR_LINK, COLOR_MUTED,
+    COLOR_QUOTE_BAR, COLOR_QUOTE_BG, COLOR_RULE, COLOR_TABLE_BORDER, COLOR_TABLE_HEADER_BG,
+    COLOR_TABLE_STRIPE_BG, COLOR_TEXT,
 };
 
 #[cfg(test)]
@@ -201,6 +202,44 @@ mod tests {
             .filter(|op| matches!(op, DrawOp::FillRect { color, .. } if *color == COLOR_INLINE_CODE_BG))
             .count();
         assert_eq!(code_pills, 1, "Expected 1 contiguous inline-code pill");
+    }
+
+    #[test]
+    fn dark_theme_inverts_preview_colors() {
+        let mut doc = DocumentLayout::new();
+        let md = "# Title\n\nText with `code` and https://example.com\n\n| A | B |\n| - | - |\n| 1 | 2 |\n";
+        layout_markdown_with_theme(
+            md,
+            400,
+            LayoutConfig::default(),
+            ThemePalette::DARK,
+            &MockMeasurer,
+            &mut doc,
+        );
+        assert!(doc
+            .ops
+            .iter()
+            .any(|op| matches!(op, DrawOp::TextRun { color, .. } if *color == ThemePalette::DARK.text)));
+        assert!(doc
+            .ops
+            .iter()
+            .any(|op| matches!(op, DrawOp::TextRun { color, style, .. } if style.link && *color == ThemePalette::DARK.link)));
+        assert!(doc
+            .ops
+            .iter()
+            .any(|op| matches!(op, DrawOp::FillRect { color, .. } if *color == ThemePalette::DARK.table_header_bg)));
+    }
+
+    #[test]
+    fn source_offset_and_y_roundtrip_for_scroll_preservation() {
+        let mut doc = DocumentLayout::new();
+        let md = include_str!("../../../fixtures/gfm_kitchen_sink.md");
+        layout_markdown(md, 380, &MockMeasurer, &mut doc);
+        let mid_y = doc.content_height / 2;
+        let src = doc.source_offset_at_y(mid_y);
+        assert!(src > 0 && src < md.len());
+        let mapped_y = doc.y_for_source_offset(src);
+        assert!(mapped_y >= 0 && mapped_y <= doc.content_height);
     }
 
     #[test]

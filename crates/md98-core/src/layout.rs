@@ -24,6 +24,58 @@ pub const COLOR_TABLE_HEADER_BG: u32 = rgb(0xE4, 0xE8, 0xF0);
 pub const COLOR_TABLE_STRIPE_BG: u32 = rgb(0xF9, 0xF9, 0xFB);
 pub const COLOR_TABLE_BORDER: u32 = rgb(0xA0, 0xA0, 0xA0);
 
+/// Theme color palette for light and dark rendering modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemePalette {
+    pub bg: u32,
+    pub text: u32,
+    pub muted: u32,
+    pub link: u32,
+    pub code_bg: u32,
+    pub inline_code_bg: u32,
+    pub code_border: u32,
+    pub quote_bar: u32,
+    pub quote_bg: u32,
+    pub rule: u32,
+    pub table_header_bg: u32,
+    pub table_stripe_bg: u32,
+    pub table_border: u32,
+}
+
+impl ThemePalette {
+    pub const LIGHT: Self = Self {
+        bg: rgb(0xFF, 0xFF, 0xFF),
+        text: COLOR_TEXT,
+        muted: COLOR_MUTED,
+        link: COLOR_LINK,
+        code_bg: COLOR_CODE_BG,
+        inline_code_bg: COLOR_INLINE_CODE_BG,
+        code_border: COLOR_CODE_BORDER,
+        quote_bar: COLOR_QUOTE_BAR,
+        quote_bg: COLOR_QUOTE_BG,
+        rule: COLOR_RULE,
+        table_header_bg: COLOR_TABLE_HEADER_BG,
+        table_stripe_bg: COLOR_TABLE_STRIPE_BG,
+        table_border: COLOR_TABLE_BORDER,
+    };
+
+    pub const DARK: Self = Self {
+        bg: rgb(0x18, 0x18, 0x18),
+        text: rgb(0xE6, 0xE6, 0xE6),
+        muted: rgb(0xA8, 0xA8, 0xA8),
+        link: rgb(0x68, 0xA8, 0xFF),
+        code_bg: rgb(0x24, 0x24, 0x24),
+        inline_code_bg: rgb(0x30, 0x30, 0x30),
+        code_border: rgb(0x50, 0x50, 0x50),
+        quote_bar: rgb(0x80, 0x80, 0x80),
+        quote_bg: rgb(0x20, 0x20, 0x20),
+        rule: rgb(0x48, 0x48, 0x48),
+        table_header_bg: rgb(0x2A, 0x32, 0x40),
+        table_stripe_bg: rgb(0x20, 0x22, 0x26),
+        table_border: rgb(0x58, 0x58, 0x58),
+    };
+}
+
 /// Font style descriptor mapped to cached Win32 `HFONT` handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FontStyle {
@@ -171,7 +223,7 @@ impl DocumentLayout {
         &self.cp1252_arena[offset..offset + len]
     }
 
-    /// Map a normalized scroll fraction (`num / den`) or source byte offset to preview Y.
+    /// Map a source byte offset to preview Y.
     pub fn y_for_source_offset(&self, byte_offset: usize) -> i32 {
         if self.blocks.is_empty() || self.source_len == 0 {
             return 0;
@@ -182,6 +234,19 @@ impl DocumentLayout {
             }
         }
         self.content_height
+    }
+
+    /// Find the approximate source byte offset at preview Y (for scroll preservation across resizes).
+    pub fn source_offset_at_y(&self, y: i32) -> usize {
+        if self.blocks.is_empty() || y <= 0 {
+            return 0;
+        }
+        for b in &self.blocks {
+            if y < b.y_end {
+                return b.source_start;
+            }
+        }
+        self.source_len
     }
 
     fn push_text(&mut self, s: &str) -> (usize, usize, usize, usize) {
@@ -256,20 +321,38 @@ impl Default for LayoutConfig {
     }
 }
 
-/// Parse GFM Markdown and populate `out` (reusing its existing heap buffers).
+/// Parse GFM Markdown and populate `out` using the default light theme.
 pub fn layout_markdown<M: TextMeasurer>(
     markdown: &str,
     viewport_width: i32,
     measurer: &M,
     out: &mut DocumentLayout,
 ) {
-    layout_markdown_with_config(markdown, viewport_width, LayoutConfig::default(), measurer, out);
+    layout_markdown_with_theme(
+        markdown,
+        viewport_width,
+        LayoutConfig::default(),
+        ThemePalette::LIGHT,
+        measurer,
+        out,
+    );
 }
 
 pub fn layout_markdown_with_config<M: TextMeasurer>(
     markdown: &str,
     viewport_width: i32,
     cfg: LayoutConfig,
+    measurer: &M,
+    out: &mut DocumentLayout,
+) {
+    layout_markdown_with_theme(markdown, viewport_width, cfg, ThemePalette::LIGHT, measurer, out);
+}
+
+pub fn layout_markdown_with_theme<M: TextMeasurer>(
+    markdown: &str,
+    viewport_width: i32,
+    cfg: LayoutConfig,
+    theme: ThemePalette,
     measurer: &M,
     out: &mut DocumentLayout,
 ) {
@@ -355,7 +438,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                 utf8_offset: uo,
                 utf8_len: ul,
                 style: m_style,
-                color: COLOR_TEXT,
+                color: theme.text,
             });
         }
 
@@ -368,6 +451,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
             avail_w,
             Alignment::Left,
             cfg.line_spacing,
+            theme,
         );
         *y = end_y;
 
@@ -380,7 +464,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                     y1: *y,
                     x2: right,
                     y2: *y,
-                    color: COLOR_RULE,
+                    color: theme.rule,
                     width: 1,
                 });
                 *y += 4;
@@ -660,7 +744,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                             y: qy_start,
                             w: 3,
                             h: qy_end - qy_start,
-                            color: COLOR_QUOTE_BAR,
+                            color: theme.quote_bar,
                         });
                         out.blocks.push(LayoutBlock {
                             kind: BlockKind::BlockQuote,
@@ -713,14 +797,14 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                         y,
                         w: box_w,
                         h: box_h,
-                        color: COLOR_CODE_BG,
+                        color: theme.code_bg,
                     });
                     out.ops.push(DrawOp::StrokeRect {
                         x: left,
                         y,
                         w: box_w,
                         h: box_h,
-                        color: COLOR_CODE_BORDER,
+                        color: theme.code_border,
                         width: 1,
                     });
 
@@ -739,7 +823,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                                 utf8_offset: uo,
                                 utf8_len: ul,
                                 style: code_style,
-                                color: COLOR_TEXT,
+                                color: theme.text,
                             });
                         }
                         cy += line_h;
@@ -840,6 +924,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                             y,
                             right - left,
                             cfg,
+                            theme,
                             range.end,
                         );
                         y += cfg.paragraph_gap;
@@ -852,11 +937,11 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                     code_buf.push_str(&t);
                 } else {
                     let base_color = if style.link {
-                        COLOR_LINK
+                        theme.link
                     } else if quote_depth > 0 {
-                        COLOR_MUTED
+                        theme.muted
                     } else {
-                        COLOR_TEXT
+                        theme.text
                     };
                     let mut pieces: Vec<InlineSpan> = Vec::new();
                     if style.link || style.monospace {
@@ -867,7 +952,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                             hard_break: false,
                         });
                     } else {
-                        split_autolinks(&t, style, base_color, &mut pieces);
+                        split_autolinks(&t, style, base_color, theme.link, &mut pieces);
                     }
                     if let Some(ts) = table_state.as_mut() {
                         if ts.in_cell {
@@ -891,7 +976,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                 let span = InlineSpan {
                     text: c.to_string(),
                     style: cs,
-                    color: if style.link { COLOR_LINK } else { COLOR_TEXT },
+                    color: if style.link { theme.link } else { theme.text },
                     hard_break: false,
                 };
                 if let Some(ts) = table_state.as_mut() {
@@ -916,7 +1001,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                     let span = InlineSpan {
                         text: " ".to_string(),
                         style,
-                        color: COLOR_TEXT,
+                        color: theme.text,
                         hard_break: false,
                     };
                     if let Some(ts) = table_state.as_mut() {
@@ -935,7 +1020,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                     let span = InlineSpan {
                         text: String::new(),
                         style,
-                        color: COLOR_TEXT,
+                        color: theme.text,
                         hard_break: true,
                     };
                     if let Some(ts) = table_state.as_mut() {
@@ -973,7 +1058,7 @@ pub fn layout_markdown_with_config<M: TextMeasurer>(
                     y1: ry,
                     x2: right,
                     y2: ry,
-                    color: COLOR_RULE,
+                    color: theme.rule,
                     width: 2,
                 });
                 out.blocks.push(LayoutBlock {
@@ -1035,6 +1120,7 @@ fn wrap_and_emit_spans<M: TextMeasurer>(
     avail_w: i32,
     align: Alignment,
     line_spacing: i32,
+    theme: ThemePalette,
 ) -> i32 {
     let mut lines: Vec<Vec<PlacedRun>> = Vec::new();
     let mut cur_line: Vec<PlacedRun> = Vec::new();
@@ -1183,7 +1269,7 @@ fn wrap_and_emit_spans<M: TextMeasurer>(
                     y: ry,
                     w: combined_w + 2,
                     h: run_h,
-                    color: COLOR_INLINE_CODE_BG,
+                    color: theme.inline_code_bg,
                 });
             }
             let (co, cl, uo, ul) = out.push_text(&combined);
@@ -1220,7 +1306,13 @@ fn push_merged_span(target: &mut Vec<InlineSpan>, span: InlineSpan) {
 }
 
 /// Detect GFM bare URLs (`http://...` and `https://...`) inside plain text spans.
-fn split_autolinks(text: &str, style: FontStyle, base_color: u32, out: &mut Vec<InlineSpan>) {
+fn split_autolinks(
+    text: &str,
+    style: FontStyle,
+    base_color: u32,
+    link_color: u32,
+    out: &mut Vec<InlineSpan>,
+) {
     let mut rest = text;
     while !rest.is_empty() {
         let next_http = rest.find("http://");
@@ -1271,7 +1363,7 @@ fn split_autolinks(text: &str, style: FontStyle, base_color: u32, out: &mut Vec<
             out.push(InlineSpan {
                 text: after[..end].to_string(),
                 style: link_style,
-                color: COLOR_LINK,
+                color: link_color,
                 hard_break: false,
             });
             rest = &after[end..];
@@ -1317,6 +1409,7 @@ fn layout_table<M: TextMeasurer>(
     y_start: i32,
     avail_w: i32,
     cfg: LayoutConfig,
+    theme: ThemePalette,
     source_end: usize,
 ) -> i32 {
     let num_cols = ts
@@ -1408,9 +1501,9 @@ fn layout_table<M: TextMeasurer>(
         // Reserve background FillRect op so text draws on top of it
         let bg_op_idx = out.ops.len();
         let bg_color = if *is_header {
-            Some(COLOR_TABLE_HEADER_BG)
+            Some(theme.table_header_bg)
         } else if row_idx % 2 == 1 {
-            Some(COLOR_TABLE_STRIPE_BG)
+            Some(theme.table_stripe_bg)
         } else {
             None
         };
@@ -1441,6 +1534,7 @@ fn layout_table<M: TextMeasurer>(
                         inner_w,
                         align,
                         2,
+                        theme,
                     );
                     max_cell_end_y = max_cell_end_y.max(end_y);
                 }
@@ -1461,7 +1555,7 @@ fn layout_table<M: TextMeasurer>(
             y1: row_y + row_h,
             x2: x_start + table_w,
             y2: row_y + row_h,
-            color: COLOR_TABLE_BORDER,
+            color: theme.table_border,
             width: 1,
         });
 
@@ -1475,7 +1569,7 @@ fn layout_table<M: TextMeasurer>(
         y: y_start,
         w: table_w,
         h: table_h,
-        color: COLOR_TABLE_BORDER,
+        color: theme.table_border,
         width: 1,
     });
     let mut vx = x_start;
@@ -1486,7 +1580,7 @@ fn layout_table<M: TextMeasurer>(
             y1: y_start,
             x2: vx,
             y2: y_start + table_h,
-            color: COLOR_TABLE_BORDER,
+            color: theme.table_border,
             width: 1,
         });
     }
