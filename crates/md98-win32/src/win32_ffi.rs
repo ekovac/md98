@@ -94,6 +94,9 @@ pub const WM_USER: UINT = 0x0400;
 pub const EM_GETFIRSTVISIBLELINE: UINT = 0x00CE;
 pub const EM_GETLINECOUNT: UINT = 0x00BA;
 pub const EM_LINEINDEX: UINT = 0x00BB;
+pub const EM_LINESCROLL: UINT = 0x00B6;
+pub const EM_GETMODIFY: UINT = 0x00B8;
+pub const EM_SETMODIFY: UINT = 0x00B9;
 pub const EM_UNDO: UINT = 0x00C7;
 pub const WM_CUT: UINT = 0x0300;
 pub const WM_COPY: UINT = 0x0301;
@@ -102,7 +105,13 @@ pub const EM_SETSEL: UINT = 0x00B1;
 pub const EM_EXGETSEL: UINT = WM_USER + 52;
 pub const EM_EXLIMITTEXT: UINT = WM_USER + 53;
 pub const EM_EXLINEFROMCHAR: UINT = WM_USER + 54;
+pub const EM_EXSETSEL: UINT = WM_USER + 55;
+pub const EM_SETBKGNDCOLOR: UINT = WM_USER + 67;
+pub const EM_SETCHARFORMAT: UINT = WM_USER + 68;
 pub const EM_SETEVENTMASK: UINT = WM_USER + 69;
+pub const SCF_DEFAULT: WPARAM = 0x0000;
+pub const SCF_ALL: WPARAM = 0x0004;
+pub const CFM_COLOR: DWORD = 0x4000_0000;
 pub const ENM_CHANGE: LPARAM = 0x0000_0001;
 pub const ENM_SCROLL: LPARAM = 0x0000_0004;
 pub const EN_CHANGE: u16 = 0x0300;
@@ -192,6 +201,7 @@ pub const VK_PRIOR: usize = 0x21;
 pub const VK_NEXT: usize = 0x22;
 pub const VK_UP: usize = 0x26;
 pub const VK_DOWN: usize = 0x28;
+pub const VK_F11: usize = 0x7A;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -280,9 +290,25 @@ pub struct LOGFONTA {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct CHARRANGE {
     pub cpMin: i32,
     pub cpMax: i32,
+}
+
+/// Win98 SE-compatible `CHARFORMATA` (60 bytes) for `EM_SETCHARFORMAT`.
+#[repr(C)]
+pub struct CHARFORMATA {
+    pub cbSize: UINT,
+    pub dwMask: DWORD,
+    pub dwEffects: DWORD,
+    pub yHeight: i32,
+    pub yOffset: i32,
+    pub crTextColor: COLORREF,
+    pub bCharSet: u8,
+    pub bPitchAndFamily: u8,
+    pub szFaceName: [u8; 32],
+    pub _pad: [u8; 2],
 }
 
 #[repr(C)]

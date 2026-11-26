@@ -7,8 +7,8 @@ use crate::gdi::{paint_preview, GdiCache, ViewportBackBuffer, Win32Measurer};
 use crate::win32_ffi::*;
 use core::ptr;
 use md98_core::{
-    cp1252_to_utf8, layout_markdown, normalize_to_crlf, normalize_to_lf, utf8_to_cp1252,
-    DocumentLayout,
+    cp1252_to_utf8, layout_markdown_with_theme, normalize_to_crlf, normalize_to_lf, utf8_to_cp1252,
+    DocumentLayout, LayoutConfig, ThemePalette,
 };
 
 const ID_EDIT: usize = 1001;
@@ -31,6 +31,8 @@ const IDM_VIEW_SPLIT: usize = 2201;
 const IDM_VIEW_EDITOR: usize = 2202;
 const IDM_VIEW_PREVIEW: usize = 2203;
 const IDM_VIEW_SYNCSCROLL: usize = 2204;
+const IDM_VIEW_DARKMODE: usize = 2205;
+const IDM_VIEW_TOGGLE_F11: usize = 2206;
 
 const IDM_HELP_ABOUT: usize = 2301;
 
@@ -55,6 +57,7 @@ struct CliOptions {
     headless_exit_ms: Option<u32>,
     stress_edits: u32,
     dump_metrics: bool,
+    dark_mode: bool,
 }
 
 struct AppState {
@@ -78,11 +81,17 @@ struct AppState {
     modified: bool,
     suppress_change: bool,
 
+    dark_mode: bool,
     view_mode: ViewMode,
     sync_scroll: bool,
     split_pos: i32,
     dragging_splitter: bool,
     splitter_rect: RECT,
+
+    // Preserved editor cursor & scroll across F11 view-mode toggles
+    saved_edit_sel: CHARRANGE,
+    saved_edit_first_line: i32,
+    has_saved_edit_pos: bool,
 
     scroll_x: i32,
     scroll_y: i32,
@@ -158,6 +167,10 @@ fn parse_cli() -> CliOptions {
             }
             "--dump-metrics" => {
                 opts.dump_metrics = true;
+                i += 1;
+            }
+            "--dark-mode" => {
+                opts.dark_mode = true;
                 i += 1;
             }
             arg if !arg.starts_with('-') && opts.fixture_path.is_none() => {
@@ -250,6 +263,161 @@ fn write_file_bytes(path: &str, data: &[u8]) -> bool {
 }
 
 impl AppState {
+    fn current_theme(&self) -> ThemePalette {
+        if self.dark_mode {
+            ThemePalette::DARK
+        } else {
+            ThemePalette::LIGHT
+        }
+    }
+
+    fn save_editor_cursor_and_scroll(&mut self) {
+        unsafe {
+            let mut cr = CHARRANGE::default();
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+            let first_line = SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32;
+            self.saved_edit_sel = cr;
+            self.saved_edit_first_line = first_line;
+            self.has_saved_edit_pos = true;
+        }
+    }
+
+    fn restore_editor_cursor_and_scroll(&self) {
+        if !self.has_saved_edit_pos {
+            return;
+        }
+        unsafe {
+            let cr = self.saved_edit_sel;
+            SendMessageA(self.hwnd_edit, EM_EXSETSEL, 0, &cr as *const _ as LPARAM);
+            let cur_first = SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32;
+            let delta = self.saved_edit_first_line - cur_first;
+            if delta != 0 {
+                SendMessageA(self.hwnd_edit, EM_LINESCROLL, 0, delta as LPARAM);
+            }
+        }
+    }
+
+    fn apply_editor_theme(&mut self) {
+        let theme = self.current_theme();
+        let prev_suppress = self.suppress_change;
+        self.suppress_change = true;
+        unsafe {
+            let was_modified = SendMessageA(self.hwnd_edit, EM_GETMODIFY, 0, 0) as WPARAM;
+            let mut cr = CHARRANGE::default();
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+            let first_line = SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32;
+
+            SendMessageA(self.hwnd_edit, EM_SETBKGNDCOLOR, 0, theme.bg as LPARAM);
+
+            let mut cf: CHARFORMATA = core::mem::zeroed();
+            cf.cbSize = core::mem::size_of::<CHARFORMATA>() as UINT;
+            cf.dwMask = CFM_COLOR;
+            cf.crTextColor = theme.text;
+            SendMessageA(self.hwnd_edit, EM_SETCHARFORMAT, SCF_ALL, &cf as *const _ as LPARAM);
+            SendMessageA(self.hwnd_edit, EM_SETCHARFORMAT, SCF_DEFAULT, &cf as *const _ as LPARAM);
+
+            SendMessageA(self.hwnd_edit, EM_EXSETSEL, 0, &cr as *const _ as LPARAM);
+            let cur_first = SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32;
+            if cur_first != first_line {
+                SendMessageA(self.hwnd_edit, EM_LINESCROLL, 0, (first_line - cur_first) as LPARAM);
+            }
+            SendMessageA(self.hwnd_edit, EM_SETMODIFY, was_modified, 0);
+            InvalidateRect(self.hwnd_edit, ptr::null(), 1);
+        }
+        self.suppress_change = prev_suppress;
+    }
+
+    fn toggle_dark_mode(&mut self) {
+        self.dark_mode = !self.dark_mode;
+        unsafe {
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_DARKMODE as UINT,
+                MF_BYCOMMAND | if self.dark_mode { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+        self.apply_editor_theme();
+        self.relayout_preview_from_cached_utf8();
+        unsafe {
+            InvalidateRect(self.hwnd_main, ptr::null(), 1);
+        }
+    }
+
+    fn set_view_mode(&mut self, new_mode: ViewMode) {
+        if new_mode == self.view_mode {
+            return;
+        }
+        let prev_mode = self.view_mode;
+
+        // When leaving a mode where the editor was active, save its caret + scroll
+        // and flush any pending debounced edits so preview reflects the latest text.
+        if prev_mode != ViewMode::PreviewOnly {
+            self.save_editor_cursor_and_scroll();
+            unsafe {
+                KillTimer(self.hwnd_main, TIMER_DEBOUNCE);
+            }
+            self.read_editor_to_utf8();
+        }
+
+        self.view_mode = new_mode;
+        unsafe {
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_SPLIT as UINT,
+                MF_BYCOMMAND | if self.view_mode == ViewMode::Split { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_EDITOR as UINT,
+                MF_BYCOMMAND | if self.view_mode == ViewMode::EditorOnly { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_PREVIEW as UINT,
+                MF_BYCOMMAND | if self.view_mode == ViewMode::PreviewOnly { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+
+        self.layout_children();
+
+        match self.view_mode {
+            ViewMode::EditorOnly => {
+                self.restore_editor_cursor_and_scroll();
+                unsafe {
+                    SetFocus(self.hwnd_edit);
+                }
+                self.update_status_bar();
+            }
+            ViewMode::PreviewOnly => {
+                if prev_mode == ViewMode::EditorOnly {
+                    // Refresh preview content in case text changed while preview was hidden,
+                    // keeping preview scroll_y intact (same viewport width).
+                    self.relayout_preview_from_cached_utf8();
+                }
+                unsafe {
+                    SetFocus(self.hwnd_preview);
+                }
+            }
+            ViewMode::Split => {
+                if prev_mode == ViewMode::PreviewOnly {
+                    self.restore_editor_cursor_and_scroll();
+                }
+                self.relayout_preview_from_cached_utf8();
+                unsafe {
+                    SetFocus(self.hwnd_edit);
+                }
+            }
+        }
+    }
+
+    fn toggle_preview_editor_f11(&mut self) {
+        if self.view_mode == ViewMode::PreviewOnly {
+            self.set_view_mode(ViewMode::EditorOnly);
+        } else {
+            self.set_view_mode(ViewMode::PreviewOnly);
+        }
+    }
+
     fn update_title(&self) {
         let name = self.current_file.as_deref().unwrap_or("Untitled");
         let star = if self.modified { "*" } else { "" };
@@ -358,21 +526,37 @@ impl AppState {
             }
         }
 
-        // Measure actual preview client area (excluding scrollbars)
-        let mut prc = RECT::default();
-        unsafe {
-            GetClientRect(self.hwnd_preview, &mut prc);
-        }
-        let new_pw = (prc.right - prc.left).max(1);
-        let new_ph = (prc.bottom - prc.top).max(1);
-        let width_changed = new_pw != self.preview_w;
-        self.preview_w = new_pw;
-        self.preview_h = new_ph;
+        // Measure actual preview client area only when preview is visible so hiding
+        // it in EditorOnly preserves its exact width and pixel scroll offset.
+        if self.view_mode != ViewMode::EditorOnly {
+            let mut prc = RECT::default();
+            unsafe {
+                GetClientRect(self.hwnd_preview, &mut prc);
+            }
+            let new_pw = (prc.right - prc.left).max(1);
+            let new_ph = (prc.bottom - prc.top).max(1);
+            let width_changed = new_pw != self.preview_w;
+            let anchor_src = if width_changed && self.scroll_y > 0 {
+                Some(self.layout.source_offset_at_y(self.scroll_y))
+            } else {
+                None
+            };
+            self.preview_w = new_pw;
+            self.preview_h = new_ph;
 
-        if width_changed {
-            self.relayout_preview_from_cached_utf8();
-        } else {
-            self.update_preview_scrollbars();
+            if width_changed {
+                self.relayout_preview_from_cached_utf8();
+                if let Some(src_off) = anchor_src {
+                    let max_y = (self.layout.content_height - self.preview_h).max(0);
+                    self.scroll_y = self.layout.y_for_source_offset(src_off).clamp(0, max_y);
+                    self.update_preview_scrollbars();
+                    unsafe {
+                        InvalidateRect(self.hwnd_preview, ptr::null(), 0);
+                    }
+                }
+            } else {
+                self.update_preview_scrollbars();
+            }
         }
     }
 
@@ -401,9 +585,17 @@ impl AppState {
     fn relayout_preview_from_cached_utf8(&mut self) {
         let t0 = unsafe { GetTickCount() };
         let vp_w = self.preview_w.max(120);
+        let theme = self.current_theme();
         {
             let measurer = Win32Measurer { cache: &self.gdi };
-            layout_markdown(&self.utf8_buf, vp_w, &measurer, &mut self.layout);
+            layout_markdown_with_theme(
+                &self.utf8_buf,
+                vp_w,
+                LayoutConfig::default(),
+                theme,
+                &measurer,
+                &mut self.layout,
+            );
         }
         self.gdi.precache_for_layout(&self.layout);
         self.last_layout_ms = unsafe { GetTickCount().wrapping_sub(t0) };
@@ -447,7 +639,7 @@ impl AppState {
     }
 
     fn sync_preview_scroll_to_editor(&mut self) {
-        if !self.sync_scroll {
+        if !self.sync_scroll || self.view_mode != ViewMode::Split {
             return;
         }
         let first_line = unsafe { SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) } as i32;
@@ -473,10 +665,15 @@ impl AppState {
         self.suppress_change = true;
         unsafe {
             SendMessageA(self.hwnd_edit, WM_SETTEXT, 0, ansi.as_ptr() as LPARAM);
+            SendMessageA(self.hwnd_edit, EM_SETMODIFY, 0, 0);
         }
+        self.apply_editor_theme();
         self.suppress_change = false;
         self.current_file = file_path;
         self.modified = false;
+        self.saved_edit_sel = CHARRANGE::default();
+        self.saved_edit_first_line = 0;
+        self.has_saved_edit_pos = false;
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.update_title();
@@ -501,6 +698,9 @@ impl AppState {
         if write_file_bytes(path, self.utf8_buf.as_bytes()) {
             self.current_file = Some(path.to_string());
             self.modified = false;
+            unsafe {
+                SendMessageA(self.hwnd_edit, EM_SETMODIFY, 0, 0);
+            }
             self.save_test_bytes = self.utf8_buf.len();
             self.update_title();
             self.update_status_bar();
@@ -594,13 +794,29 @@ impl AppState {
         unsafe {
             GlobalMemoryStatus(&mut ms);
         }
+        let (cur_sel_min, cur_first_line) = unsafe {
+            let mut cr = CHARRANGE::default();
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+            let fl = SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32;
+            (cr.cpMin, fl)
+        };
+        let mode_str = match self.view_mode {
+            ViewMode::Split => "split",
+            ViewMode::EditorOnly => "editor",
+            ViewMode::PreviewOnly => "preview",
+        };
         let report = format!(
-            "source_bytes={}\nblocks={}\ndraw_ops={}\ncontent_height={}\nlayout_ms={}\ngdi_live_initial={}\ngdi_live_final={}\ngdi_delta={}\ngdi_created={}\ngdi_deleted={}\ngdi_live_dcs={}\npaint_count={}\nbackbuffer_reallocs={}\nstress_edits={}\nsave_test_bytes={}\nmem_load={}\ntotal_phys={}\navail_phys={}\n",
+            "source_bytes={}\nblocks={}\ndraw_ops={}\ncontent_height={}\nlayout_ms={}\ndark_mode={}\nview_mode={}\nedit_sel_min={}\nedit_first_line={}\npreview_scroll_y={}\ngdi_live_initial={}\ngdi_live_final={}\ngdi_delta={}\ngdi_created={}\ngdi_deleted={}\ngdi_live_dcs={}\npaint_count={}\nbackbuffer_reallocs={}\nstress_edits={}\nsave_test_bytes={}\nmem_load={}\ntotal_phys={}\navail_phys={}\n",
             self.utf8_buf.len(),
             self.layout.blocks.len(),
             self.layout.ops.len(),
             self.layout.content_height,
             self.last_layout_ms,
+            if self.dark_mode { 1 } else { 0 },
+            mode_str,
+            cur_sel_min,
+            cur_first_line,
+            self.scroll_y,
             self.gdi_live_initial,
             self.gdi.stats.live_objects(),
             self.gdi.stats.live_objects() - self.gdi_live_initial,
@@ -650,8 +866,10 @@ fn build_menu() -> HMENU {
         AppendMenuA(view, MF_STRING | MF_CHECKED, IDM_VIEW_SPLIT, b"&Split View\0".as_ptr());
         AppendMenuA(view, MF_STRING, IDM_VIEW_EDITOR, b"&Editor Only\0".as_ptr());
         AppendMenuA(view, MF_STRING, IDM_VIEW_PREVIEW, b"&Preview Only\0".as_ptr());
+        AppendMenuA(view, MF_STRING, IDM_VIEW_TOGGLE_F11, b"&Toggle Preview/Editor\tF11\0".as_ptr());
         AppendMenuA(view, MF_SEPARATOR, 0, ptr::null());
         AppendMenuA(view, MF_STRING | MF_CHECKED, IDM_VIEW_SYNCSCROLL, b"Sync &Scroll\0".as_ptr());
+        AppendMenuA(view, MF_STRING, IDM_VIEW_DARKMODE, b"&Dark Mode\tCtrl+D\0".as_ptr());
         AppendMenuA(menu, MF_POPUP, view as usize, b"&View\0".as_ptr());
 
         let help = CreatePopupMenu();
@@ -685,6 +903,7 @@ unsafe extern "system" fn preview_wnd_proc(
                 st.preview_h,
                 st.scroll_x,
                 st.scroll_y,
+                st.current_theme().bg,
                 &st.layout,
                 &mut st.gdi,
                 &mut st.backbuf,
@@ -793,7 +1012,12 @@ unsafe extern "system" fn main_wnd_proc(
             let mut ps: PAINTSTRUCT = core::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
             if st.view_mode == ViewMode::Split {
-                FillRect(hdc, &st.splitter_rect, st.gdi.splitter_brush);
+                let brush = if st.dark_mode {
+                    st.gdi.dark_splitter_brush
+                } else {
+                    st.gdi.splitter_brush
+                };
+                FillRect(hdc, &st.splitter_rect, brush);
             }
             EndPaint(hwnd, &ps);
             0
@@ -844,9 +1068,11 @@ unsafe extern "system" fn main_wnd_proc(
 
             if id == ID_EDIT {
                 if code == EN_CHANGE && !st.suppress_change {
-                    st.modified = true;
-                    st.update_title();
-                    SetTimer(hwnd, TIMER_DEBOUNCE, DEBOUNCE_MS, ptr::null_mut());
+                    if SendMessageA(st.hwnd_edit, EM_GETMODIFY, 0, 0) != 0 {
+                        st.modified = true;
+                        st.update_title();
+                        SetTimer(hwnd, TIMER_DEBOUNCE, DEBOUNCE_MS, ptr::null_mut());
+                    }
                     return 0;
                 } else if code == EN_VSCROLL {
                     st.sync_preview_scroll_to_editor();
@@ -890,27 +1116,18 @@ unsafe extern "system" fn main_wnd_proc(
                     SendMessageA(st.hwnd_edit, EM_SETSEL, 0, -1);
                 }
                 IDM_VIEW_SPLIT | IDM_VIEW_EDITOR | IDM_VIEW_PREVIEW => {
-                    st.view_mode = match id {
+                    let target = match id {
                         IDM_VIEW_EDITOR => ViewMode::EditorOnly,
                         IDM_VIEW_PREVIEW => ViewMode::PreviewOnly,
                         _ => ViewMode::Split,
                     };
-                    CheckMenuItem(
-                        st.hmenu,
-                        IDM_VIEW_SPLIT as UINT,
-                        MF_BYCOMMAND | if st.view_mode == ViewMode::Split { MF_CHECKED } else { MF_UNCHECKED },
-                    );
-                    CheckMenuItem(
-                        st.hmenu,
-                        IDM_VIEW_EDITOR as UINT,
-                        MF_BYCOMMAND | if st.view_mode == ViewMode::EditorOnly { MF_CHECKED } else { MF_UNCHECKED },
-                    );
-                    CheckMenuItem(
-                        st.hmenu,
-                        IDM_VIEW_PREVIEW as UINT,
-                        MF_BYCOMMAND | if st.view_mode == ViewMode::PreviewOnly { MF_CHECKED } else { MF_UNCHECKED },
-                    );
-                    st.layout_children();
+                    st.set_view_mode(target);
+                }
+                IDM_VIEW_TOGGLE_F11 => {
+                    st.toggle_preview_editor_f11();
+                }
+                IDM_VIEW_DARKMODE => {
+                    st.toggle_dark_mode();
                 }
                 IDM_VIEW_SYNCSCROLL => {
                     st.sync_scroll = !st.sync_scroll;
@@ -1099,6 +1316,7 @@ pub fn run() {
         SendMessageA(hwnd_edit, WM_SETFONT, gdi.editor_font as WPARAM, 1);
         SendMessageA(hwnd_edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SCROLL);
 
+        let start_dark = cli.dark_mode;
         let mut state = Box::new(AppState {
             hwnd_main,
             hwnd_edit,
@@ -1115,11 +1333,15 @@ pub fn run() {
             current_file: None,
             modified: false,
             suppress_change: false,
+            dark_mode: start_dark,
             view_mode: ViewMode::Split,
             sync_scroll: true,
             split_pos: 360,
             dragging_splitter: false,
             splitter_rect: RECT::default(),
+            saved_edit_sel: CHARRANGE::default(),
+            saved_edit_first_line: 0,
+            has_saved_edit_pos: false,
             scroll_x: 0,
             scroll_y: 0,
             preview_w: 380,
@@ -1134,6 +1356,10 @@ pub fn run() {
         let state_ptr = state.as_mut() as *mut AppState;
         SetWindowLongA(hwnd_main, GWL_USERDATA, state_ptr as isize);
         SetWindowLongA(hwnd_preview, GWL_USERDATA, state_ptr as isize);
+
+        if state.dark_mode {
+            CheckMenuItem(hmenu, IDM_VIEW_DARKMODE as UINT, MF_BYCOMMAND | MF_CHECKED);
+        }
 
         ShowWindow(hwnd_main, SW_MAXIMIZE);
         state.layout_children();
@@ -1163,22 +1389,32 @@ pub fn run() {
 
         let mut msg: MSG = core::mem::zeroed();
         while GetMessageA(&mut msg, ptr::null_mut(), 0, 0) > 0 {
-            // Simple keyboard shortcuts (Ctrl+N, Ctrl+O, Ctrl+S)
-            if msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 {
-                match msg.wParam as u8 {
-                    b'N' => {
-                        PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_NEW, 0);
-                        continue;
+            if msg.message == WM_KEYDOWN {
+                if msg.wParam == VK_F11 {
+                    PostMessageA(hwnd_main, WM_COMMAND, IDM_VIEW_TOGGLE_F11, 0);
+                    continue;
+                }
+                // Simple keyboard shortcuts (Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+D)
+                if (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 {
+                    match msg.wParam as u8 {
+                        b'N' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_NEW, 0);
+                            continue;
+                        }
+                        b'O' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_OPEN, 0);
+                            continue;
+                        }
+                        b'S' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_SAVE, 0);
+                            continue;
+                        }
+                        b'D' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_VIEW_DARKMODE, 0);
+                            continue;
+                        }
+                        _ => {}
                     }
-                    b'O' => {
-                        PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_OPEN, 0);
-                        continue;
-                    }
-                    b'S' => {
-                        PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_SAVE, 0);
-                        continue;
-                    }
-                    _ => {}
                 }
             }
             TranslateMessage(&msg);

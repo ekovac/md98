@@ -9,9 +9,7 @@ use crate::win32_ffi::*;
 use core::cell::RefCell;
 use core::ptr;
 use md98_core::{
-    rgb, utf8_to_cp1252_into, DocumentLayout, DrawOp, FontStyle, TextMeasurer, COLOR_CODE_BG,
-    COLOR_CODE_BORDER, COLOR_INLINE_CODE_BG, COLOR_QUOTE_BAR, COLOR_QUOTE_BG, COLOR_RULE,
-    COLOR_TABLE_BORDER, COLOR_TABLE_HEADER_BG, COLOR_TABLE_STRIPE_BG,
+    rgb, utf8_to_cp1252_into, DocumentLayout, DrawOp, FontStyle, TextMeasurer, ThemePalette,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -42,6 +40,7 @@ pub struct GdiCache {
     pens: Vec<((COLORREF, i32), HPEN)>,
     pub white_brush: HBRUSH,
     pub splitter_brush: HBRUSH,
+    pub dark_splitter_brush: HBRUSH,
     measure_dc: HDC,
     measure_scratch: RefCell<Vec<u8>>,
     pub stats: GdiStats,
@@ -60,10 +59,11 @@ impl GdiCache {
         let mut cache = Self {
             editor_font: ptr::null_mut(),
             fonts: Vec::with_capacity(32),
-            brushes: Vec::with_capacity(16),
-            pens: Vec::with_capacity(16),
+            brushes: Vec::with_capacity(24),
+            pens: Vec::with_capacity(24),
             white_brush: ptr::null_mut(),
             splitter_brush: ptr::null_mut(),
+            dark_splitter_brush: ptr::null_mut(),
             measure_dc,
             measure_scratch: RefCell::new(Vec::with_capacity(256)),
             stats,
@@ -72,26 +72,30 @@ impl GdiCache {
         cache.editor_font = cache.create_font_raw("Courier New", -14, FW_NORMAL, false, false, false, true);
         cache.white_brush = cache.create_brush(rgb(0xFF, 0xFF, 0xFF));
         cache.splitter_brush = cache.create_brush(rgb(0xC0, 0xC0, 0xC0));
+        cache.dark_splitter_brush = cache.create_brush(rgb(0x3C, 0x3C, 0x3C));
 
-        // Pre-populate core brushes & pens so WM_PAINT allocates ZERO GDI objects
-        for &c in &[
-            rgb(0xFF, 0xFF, 0xFF),
-            COLOR_CODE_BG,
-            COLOR_INLINE_CODE_BG,
-            COLOR_QUOTE_BAR,
-            COLOR_QUOTE_BG,
-            COLOR_TABLE_HEADER_BG,
-            COLOR_TABLE_STRIPE_BG,
-        ] {
-            let _ = cache.get_or_create_brush(c);
-        }
-        for &(c, w) in &[
-            (COLOR_CODE_BORDER, 1),
-            (COLOR_RULE, 1),
-            (COLOR_RULE, 2),
-            (COLOR_TABLE_BORDER, 1),
-        ] {
-            let _ = cache.get_or_create_pen(c, w);
+        // Pre-populate core brushes & pens for BOTH Light and Dark themes so toggling
+        // dark mode or painting allocates ZERO GDI objects.
+        for theme in [ThemePalette::LIGHT, ThemePalette::DARK] {
+            for &c in &[
+                theme.bg,
+                theme.code_bg,
+                theme.inline_code_bg,
+                theme.quote_bar,
+                theme.quote_bg,
+                theme.table_header_bg,
+                theme.table_stripe_bg,
+            ] {
+                let _ = cache.get_or_create_brush(c);
+            }
+            for &(c, w) in &[
+                (theme.code_border, 1),
+                (theme.rule, 1),
+                (theme.rule, 2),
+                (theme.table_border, 1),
+            ] {
+                let _ = cache.get_or_create_pen(c, w);
+            }
         }
 
         // Pre-populate standard fonts (body, headings H1-H6, bold/italic/strike/link/mono)
@@ -323,6 +327,10 @@ impl Drop for GdiCache {
                 DeleteObject(self.splitter_brush);
                 self.stats.objects_deleted += 1;
             }
+            if !self.dark_splitter_brush.is_null() {
+                DeleteObject(self.dark_splitter_brush);
+                self.stats.objects_deleted += 1;
+            }
             for &(_, h) in &self.fonts {
                 if !h.is_null() {
                     DeleteObject(h);
@@ -435,6 +443,7 @@ pub fn paint_preview(
     view_h: i32,
     scroll_x: i32,
     scroll_y: i32,
+    bg_color: COLORREF,
     layout: &DocumentLayout,
     cache: &mut GdiCache,
     backbuf: &mut ViewportBackBuffer,
@@ -455,7 +464,7 @@ pub fn paint_preview(
             right: view_w,
             bottom: view_h,
         };
-        FillRect(mem_dc, &full, cache.white_brush);
+        FillRect(mem_dc, &full, cache.lookup_brush(bg_color));
         SetBkMode(mem_dc, TRANSPARENT);
 
         let vis_top = scroll_y - 32;
