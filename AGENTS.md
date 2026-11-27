@@ -15,7 +15,7 @@ All autonomous agents (including Google Antigravity) must strictly adhere to the
 - Build `md98-win32` exclusively via `scripts/build_win98.sh` (Dockerized `rust9x` + `rust-lld` + `r9xrsrt`).
 - Enforce `-C target-cpu=pentiumpro -C target-feature=-mmx,-sse,-sse2` in `.cargo/config.toml`.
 - Keep `opt-level = "s"`, `lto = true`, `codegen-units = 1`, `strip = true`.
-- **Allowed DLLs:** `KERNEL32.DLL`, `USER32.DLL`, `GDI32.DLL`, `COMDLG32.DLL`, `COMCTL32.DLL`, `RICHED20.DLL`.
+- **Allowed DLLs:** `KERNEL32.DLL`, `USER32.DLL`, `GDI32.DLL`, `ADVAPI32.DLL`, `COMDLG32.DLL`, `COMCTL32.DLL`, `RICHED20.DLL`.
 
 ## 3. Architectural Invariants
 - Keep parsing, wrapping, and `DrawOp` generation in `md98-core` behind `TextMeasurer`.

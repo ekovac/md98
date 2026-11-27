@@ -7,8 +7,9 @@ use crate::gdi::{paint_preview, GdiCache, ViewportBackBuffer, Win32Measurer};
 use crate::win32_ffi::*;
 use core::ptr;
 use md98_core::{
-    cp1252_to_utf8, layout_markdown_with_theme, normalize_to_crlf, normalize_to_lf, utf8_to_cp1252,
-    DocumentLayout, LayoutConfig, ThemePalette,
+    compute_live_wrap_break, cp1252_to_utf8, find_cp1252, is_line_in_fenced_code,
+    layout_markdown_with_theme, normalize_to_crlf, normalize_to_lf, reflow_markdown,
+    replace_all_text, utf8_to_cp1252, DocumentLayout, LayoutConfig, ThemePalette,
 };
 
 const ID_EDIT: usize = 1001;
@@ -26,6 +27,15 @@ const IDM_EDIT_CUT: usize = 2102;
 const IDM_EDIT_COPY: usize = 2103;
 const IDM_EDIT_PASTE: usize = 2104;
 const IDM_EDIT_SELECTALL: usize = 2105;
+const IDM_EDIT_FIND: usize = 2106;
+const IDM_EDIT_FINDNEXT: usize = 2107;
+const IDM_EDIT_REPLACE: usize = 2108;
+const IDM_EDIT_REFLOW: usize = 2109;
+const IDM_EDIT_LIVEWRAP: usize = 2110;
+const IDM_EDIT_REFLOW_ONSAVE: usize = 2111;
+const IDM_EDIT_WRAP_72: usize = 2112;
+const IDM_EDIT_WRAP_80: usize = 2113;
+const IDM_EDIT_WRAP_100: usize = 2114;
 
 const IDM_VIEW_SPLIT: usize = 2201;
 const IDM_VIEW_EDITOR: usize = 2202;
@@ -42,12 +52,161 @@ const TIMER_STRESS: usize = 3;
 
 const DEBOUNCE_MS: UINT = 250;
 const SPLITTER_WIDTH: i32 = 4;
+const REG_SUBKEY: &[u8] = b"Software\\md98\0";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Split,
     EditorOnly,
     PreviewOnly,
+}
+
+impl ViewMode {
+    fn to_dword(self) -> DWORD {
+        match self {
+            ViewMode::Split => 0,
+            ViewMode::EditorOnly => 1,
+            ViewMode::PreviewOnly => 2,
+        }
+    }
+
+    fn from_dword(v: DWORD) -> Self {
+        match v {
+            1 => ViewMode::EditorOnly,
+            2 => ViewMode::PreviewOnly,
+            _ => ViewMode::Split,
+        }
+    }
+}
+
+struct Prefs {
+    view_mode: ViewMode,
+    dark_mode: bool,
+    sync_scroll: bool,
+    wrap_width: usize,
+    live_wrap: bool,
+    reflow_on_save: bool,
+    split_pos: i32,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            view_mode: ViewMode::Split,
+            dark_mode: false,
+            sync_scroll: true,
+            wrap_width: 80,
+            live_wrap: false,
+            reflow_on_save: false,
+            split_pos: 360,
+        }
+    }
+}
+
+fn reg_read_dword(hkey: HKEY, name: &[u8]) -> Option<DWORD> {
+    let mut reg_type: DWORD = 0;
+    let mut val: DWORD = 0;
+    let mut sz: DWORD = core::mem::size_of::<DWORD>() as DWORD;
+    let status = unsafe {
+        RegQueryValueExA(
+            hkey,
+            name.as_ptr(),
+            ptr::null_mut(),
+            &mut reg_type,
+            &mut val as *mut DWORD as *mut u8,
+            &mut sz,
+        )
+    };
+    if status == ERROR_SUCCESS && reg_type == REG_DWORD && sz == 4 {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+fn reg_write_dword(hkey: HKEY, name: &[u8], val: DWORD) {
+    unsafe {
+        let _ = RegSetValueExA(
+            hkey,
+            name.as_ptr(),
+            0,
+            REG_DWORD,
+            &val as *const DWORD as *const u8,
+            core::mem::size_of::<DWORD>() as DWORD,
+        );
+    }
+}
+
+fn load_prefs_from_registry() -> Prefs {
+    let mut prefs = Prefs::default();
+    let mut hkey: HKEY = ptr::null_mut();
+    let status = unsafe { RegOpenKeyExA(HKEY_CURRENT_USER, REG_SUBKEY.as_ptr(), 0, KEY_READ, &mut hkey) };
+    if status != ERROR_SUCCESS || hkey.is_null() {
+        return prefs;
+    }
+    if let Some(v) = reg_read_dword(hkey, b"ViewMode\0") {
+        prefs.view_mode = ViewMode::from_dword(v);
+    }
+    if let Some(v) = reg_read_dword(hkey, b"DarkMode\0") {
+        prefs.dark_mode = v != 0;
+    }
+    if let Some(v) = reg_read_dword(hkey, b"SyncScroll\0") {
+        prefs.sync_scroll = v != 0;
+    }
+    if let Some(v) = reg_read_dword(hkey, b"WrapWidth\0") {
+        let w = v as usize;
+        if matches!(w, 72 | 80 | 100) {
+            prefs.wrap_width = w;
+        }
+    }
+    if let Some(v) = reg_read_dword(hkey, b"LiveWrap\0") {
+        prefs.live_wrap = v != 0;
+    }
+    if let Some(v) = reg_read_dword(hkey, b"ReflowOnSave\0") {
+        prefs.reflow_on_save = v != 0;
+    }
+    if let Some(v) = reg_read_dword(hkey, b"SplitPos\0") {
+        if (100..=2000).contains(&v) {
+            prefs.split_pos = v as i32;
+        }
+    }
+    unsafe {
+        RegCloseKey(hkey);
+    }
+    prefs
+}
+
+fn save_prefs_to_registry(prefs: &Prefs) {
+    let mut hkey: HKEY = ptr::null_mut();
+    let mut disp: DWORD = 0;
+    let status = unsafe {
+        RegCreateKeyExA(
+            HKEY_CURRENT_USER,
+            REG_SUBKEY.as_ptr(),
+            0,
+            ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            ptr::null_mut(),
+            &mut hkey,
+            &mut disp,
+        )
+    };
+    if status != ERROR_SUCCESS || hkey.is_null() {
+        return;
+    }
+    reg_write_dword(hkey, b"ViewMode\0", prefs.view_mode.to_dword());
+    reg_write_dword(hkey, b"DarkMode\0", if prefs.dark_mode { 1 } else { 0 });
+    reg_write_dword(hkey, b"SyncScroll\0", if prefs.sync_scroll { 1 } else { 0 });
+    reg_write_dword(hkey, b"WrapWidth\0", prefs.wrap_width as DWORD);
+    reg_write_dword(hkey, b"LiveWrap\0", if prefs.live_wrap { 1 } else { 0 });
+    reg_write_dword(hkey, b"ReflowOnSave\0", if prefs.reflow_on_save { 1 } else { 0 });
+    if prefs.split_pos > 0 {
+        reg_write_dword(hkey, b"SplitPos\0", prefs.split_pos as DWORD);
+    }
+    unsafe {
+        RegCloseKey(hkey);
+    }
 }
 
 #[derive(Default)]
@@ -58,6 +217,9 @@ struct CliOptions {
     stress_edits: u32,
     dump_metrics: bool,
     dark_mode: bool,
+    wrap_width: Option<usize>,
+    live_wrap: bool,
+    reflow_on_save: bool,
 }
 
 struct AppState {
@@ -68,6 +230,20 @@ struct AppState {
     hmenu: HMENU,
     hcursor_sizewe: HCURSOR,
     hriched_dll: HMODULE,
+
+    // Native COMDLG32 modeless Find / Replace dialog state (pinned inside Box<AppState>)
+    msg_find_replace: UINT,
+    hwnd_find: HWND,
+    find_is_replace: bool,
+    find_fr: FINDREPLACEA,
+    find_buf: [u8; 256],
+    replace_buf: [u8; 256],
+    find_flags: DWORD,
+
+    // Reflow / Live Auto-Wrap state (72, 80, or 100 chars)
+    wrap_width: usize,
+    live_wrap: bool,
+    reflow_on_save: bool,
 
     gdi: GdiCache,
     backbuf: ViewportBackBuffer,
@@ -103,6 +279,7 @@ struct AppState {
     gdi_live_initial: i32,
     stress_completed: u32,
     save_test_bytes: usize,
+    replace_count: usize,
 }
 
 /// Convert UTF-8 string to NUL-terminated Windows-1252 (CP1252) bytes for Win32 `*A` APIs.
@@ -171,6 +348,22 @@ fn parse_cli() -> CliOptions {
             }
             "--dark-mode" => {
                 opts.dark_mode = true;
+                i += 1;
+            }
+            "--wrap-width" if i + 1 < tokens.len() => {
+                if let Ok(w) = tokens[i + 1].parse::<usize>() {
+                    if matches!(w, 72 | 80 | 100) {
+                        opts.wrap_width = Some(w);
+                    }
+                }
+                i += 2;
+            }
+            "--live-wrap" => {
+                opts.live_wrap = true;
+                i += 1;
+            }
+            "--reflow-on-save" => {
+                opts.reflow_on_save = true;
                 i += 1;
             }
             arg if !arg.starts_with('-') && opts.fixture_path.is_none() => {
@@ -327,6 +520,74 @@ impl AppState {
         self.suppress_change = prev_suppress;
     }
 
+    fn save_prefs(&self) {
+        let prefs = Prefs {
+            view_mode: self.view_mode,
+            dark_mode: self.dark_mode,
+            sync_scroll: self.sync_scroll,
+            wrap_width: self.wrap_width,
+            live_wrap: self.live_wrap,
+            reflow_on_save: self.reflow_on_save,
+            split_pos: self.split_pos,
+        };
+        save_prefs_to_registry(&prefs);
+    }
+
+    fn sync_all_menu_checks(&self) {
+        unsafe {
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_SPLIT as UINT,
+                MF_BYCOMMAND | if self.view_mode == ViewMode::Split { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_EDITOR as UINT,
+                MF_BYCOMMAND | if self.view_mode == ViewMode::EditorOnly { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_PREVIEW as UINT,
+                MF_BYCOMMAND | if self.view_mode == ViewMode::PreviewOnly { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_SYNCSCROLL as UINT,
+                MF_BYCOMMAND | if self.sync_scroll { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_VIEW_DARKMODE as UINT,
+                MF_BYCOMMAND | if self.dark_mode { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_WRAP_72 as UINT,
+                MF_BYCOMMAND | if self.wrap_width == 72 { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_WRAP_80 as UINT,
+                MF_BYCOMMAND | if self.wrap_width == 80 { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_WRAP_100 as UINT,
+                MF_BYCOMMAND | if self.wrap_width == 100 { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_LIVEWRAP as UINT,
+                MF_BYCOMMAND | if self.live_wrap { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_REFLOW_ONSAVE as UINT,
+                MF_BYCOMMAND | if self.reflow_on_save { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+    }
+
     fn toggle_dark_mode(&mut self) {
         self.dark_mode = !self.dark_mode;
         unsafe {
@@ -336,6 +597,7 @@ impl AppState {
                 MF_BYCOMMAND | if self.dark_mode { MF_CHECKED } else { MF_UNCHECKED },
             );
         }
+        self.save_prefs();
         self.apply_editor_theme();
         self.relayout_preview_from_cached_utf8();
         unsafe {
@@ -379,6 +641,7 @@ impl AppState {
         }
 
         self.layout_children();
+        self.save_prefs();
 
         match self.view_mode {
             ViewMode::EditorOnly => {
@@ -418,6 +681,429 @@ impl AppState {
         }
     }
 
+    fn set_wrap_width(&mut self, width: usize) {
+        self.wrap_width = width;
+        unsafe {
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_WRAP_72 as UINT,
+                MF_BYCOMMAND | if width == 72 { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_WRAP_80 as UINT,
+                MF_BYCOMMAND | if width == 80 { MF_CHECKED } else { MF_UNCHECKED },
+            );
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_WRAP_100 as UINT,
+                MF_BYCOMMAND | if width == 100 { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+        self.save_prefs();
+        self.update_status_bar();
+    }
+
+    fn toggle_live_wrap(&mut self) {
+        self.live_wrap = !self.live_wrap;
+        unsafe {
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_LIVEWRAP as UINT,
+                MF_BYCOMMAND | if self.live_wrap { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+        self.save_prefs();
+        self.update_status_bar();
+    }
+
+    fn toggle_reflow_on_save(&mut self) {
+        self.reflow_on_save = !self.reflow_on_save;
+        unsafe {
+            CheckMenuItem(
+                self.hmenu,
+                IDM_EDIT_REFLOW_ONSAVE as UINT,
+                MF_BYCOMMAND | if self.reflow_on_save { MF_CHECKED } else { MF_UNCHECKED },
+            );
+        }
+        self.save_prefs();
+        self.update_status_bar();
+    }
+
+    /// Reflow the entire document in-place while preserving caret & scroll position.
+    fn reflow_full_document(&mut self) -> bool {
+        let mut cr = CHARRANGE::default();
+        let first_line = unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+            SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32
+        };
+        self.read_editor_to_utf8();
+        let reflowed = reflow_markdown(&self.utf8_buf, self.wrap_width);
+        if reflowed == self.utf8_buf {
+            return false;
+        }
+        let crlf = normalize_to_crlf(&reflowed);
+        let mut ansi = utf8_to_cp1252(&crlf);
+        let max_cp = reflowed.chars().count() as i32;
+        ansi.push(0);
+        self.suppress_change = true;
+        unsafe {
+            SendMessageA(self.hwnd_edit, WM_SETTEXT, 0, ansi.as_ptr() as LPARAM);
+            SendMessageA(self.hwnd_edit, EM_SETMODIFY, 1, 0);
+        }
+        self.apply_editor_theme();
+        let restored = CHARRANGE {
+            cpMin: cr.cpMin.clamp(0, max_cp),
+            cpMax: cr.cpMin.clamp(0, max_cp),
+        };
+        unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXSETSEL, 0, &restored as *const _ as LPARAM);
+            let cur_first = SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32;
+            if cur_first != first_line {
+                SendMessageA(self.hwnd_edit, EM_LINESCROLL, 0, (first_line - cur_first) as LPARAM);
+            }
+        }
+        self.suppress_change = false;
+        self.utf8_buf = reflowed;
+        self.relayout_preview_from_cached_utf8();
+        true
+    }
+
+    /// On-demand reflow: reflows current selection if non-empty, otherwise the entire document.
+    fn reflow_editor_text(&mut self) {
+        let mut cr = CHARRANGE::default();
+        unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+        }
+
+        if cr.cpMax > cr.cpMin {
+            // Reflow selected range (undoable via EM_REPLACESEL)
+            let sel_len = (cr.cpMax - cr.cpMin) as usize;
+            let mut sel_buf = vec![0u8; sel_len + 4];
+            let copied = unsafe {
+                SendMessageA(self.hwnd_edit, EM_GETSELTEXT, 0, sel_buf.as_mut_ptr() as LPARAM)
+            } as usize;
+            let actual = copied.min(sel_buf.len());
+            let sel_utf8 = normalize_to_lf(&cp1252_to_utf8(&sel_buf[..actual]));
+            let reflowed = reflow_markdown(&sel_utf8, self.wrap_width);
+            if reflowed != sel_utf8 {
+                let crlf = normalize_to_crlf(&reflowed);
+                let mut ansi = utf8_to_cp1252(&crlf);
+                ansi.push(0);
+                self.suppress_change = true;
+                unsafe {
+                    SendMessageA(self.hwnd_edit, EM_REPLACESEL, 1, ansi.as_ptr() as LPARAM);
+                    SendMessageA(self.hwnd_edit, EM_SETMODIFY, 1, 0);
+                }
+                self.apply_editor_theme();
+                self.suppress_change = false;
+                self.modified = true;
+                self.update_title();
+                self.relayout_preview_from_editor();
+            }
+            return;
+        }
+
+        if self.reflow_full_document() {
+            self.modified = true;
+            self.update_title();
+        }
+    }
+
+    /// Live auto-wrap: when enabled and current line exceeds `wrap_width`, breaks cleanly at word boundary.
+    fn maybe_live_wrap_current_line(&mut self) {
+        if !self.live_wrap || self.suppress_change {
+            return;
+        }
+        let mut cr = CHARRANGE::default();
+        unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+        }
+        if cr.cpMin != cr.cpMax {
+            return;
+        }
+        self.read_editor_to_utf8();
+        // Locate the hard-newline paragraph containing the caret directly in CP1252-LF offsets
+        // (avoiding EM_EXLINEFROMCHAR which counts visually soft-wrapped display lines).
+        let cp1252 = utf8_to_cp1252(&self.utf8_buf);
+        let caret = (cr.cpMin.max(0) as usize).min(cp1252.len());
+        let hard_start = cp1252[..caret]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let hard_end = cp1252[caret..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| caret + i)
+            .unwrap_or(cp1252.len());
+        let hard_line_idx = cp1252[..hard_start].iter().filter(|&&b| b == b'\n').count();
+        let line_str = cp1252_to_utf8(&cp1252[hard_start..hard_end]);
+
+        let in_fence = is_line_in_fenced_code(&self.utf8_buf, hard_line_idx);
+        let Some((break_char_off, insert_str)) =
+            compute_live_wrap_break(&line_str, self.wrap_width, in_fence)
+        else {
+            return;
+        };
+
+        let break_cp = (hard_start + break_char_off) as i32;
+        if cr.cpMin <= break_cp {
+            return;
+        }
+
+        // Replace the single space at `break_cp` with `\r\n` + hanging prefix
+        let cont_chars = insert_str.chars().count().saturating_sub(2) as i32;
+        let mut repl_ansi = utf8_to_cp1252(&insert_str);
+        repl_ansi.push(0);
+        let target = CHARRANGE {
+            cpMin: break_cp,
+            cpMax: break_cp + 1,
+        };
+        let new_caret = CHARRANGE {
+            cpMin: cr.cpMin + cont_chars,
+            cpMax: cr.cpMin + cont_chars,
+        };
+        self.suppress_change = true;
+        unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXSETSEL, 0, &target as *const _ as LPARAM);
+            SendMessageA(self.hwnd_edit, EM_REPLACESEL, 1, repl_ansi.as_ptr() as LPARAM);
+            SendMessageA(self.hwnd_edit, EM_EXSETSEL, 0, &new_caret as *const _ as LPARAM);
+            SendMessageA(self.hwnd_edit, EM_SCROLLCARET, 0, 0);
+        }
+        self.suppress_change = false;
+    }
+
+    fn find_what_str(&self) -> String {
+        let len = self.find_buf.iter().position(|&b| b == 0).unwrap_or(self.find_buf.len());
+        cp1252_to_utf8(&self.find_buf[..len])
+    }
+
+    fn replace_with_str(&self) -> String {
+        let len = self.replace_buf.iter().position(|&b| b == 0).unwrap_or(self.replace_buf.len());
+        cp1252_to_utf8(&self.replace_buf[..len])
+    }
+
+    fn open_find_dialog(&mut self, replace: bool) {
+        if self.view_mode == ViewMode::PreviewOnly {
+            self.set_view_mode(ViewMode::EditorOnly);
+        }
+        if !self.hwnd_find.is_null() {
+            if self.find_is_replace == replace {
+                unsafe {
+                    SetFocus(self.hwnd_find);
+                }
+                return;
+            }
+            unsafe {
+                DestroyWindow(self.hwnd_find);
+            }
+            self.hwnd_find = ptr::null_mut();
+        }
+
+        // Pre-fill Find box with current single-line selection if non-empty
+        let mut cr = CHARRANGE::default();
+        unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+        }
+        if cr.cpMax > cr.cpMin && (cr.cpMax - cr.cpMin) < 128 {
+            let mut sel = vec![0u8; (cr.cpMax - cr.cpMin) as usize + 4];
+            let copied = unsafe {
+                SendMessageA(self.hwnd_edit, EM_GETSELTEXT, 0, sel.as_mut_ptr() as LPARAM)
+            } as usize;
+            let slice = &sel[..copied.min(sel.len())];
+            if !slice.contains(&b'\r') && !slice.contains(&b'\n') && !slice.is_empty() {
+                let n = slice.len().min(self.find_buf.len() - 1);
+                self.find_buf[..n].copy_from_slice(&slice[..n]);
+                self.find_buf[n] = 0;
+            }
+        }
+
+        self.find_fr = unsafe { core::mem::zeroed() };
+        self.find_fr.lStructSize = core::mem::size_of::<FINDREPLACEA>() as DWORD;
+        self.find_fr.hwndOwner = self.hwnd_main;
+        self.find_fr.Flags = self.find_flags;
+        self.find_fr.lpstrFindWhat = self.find_buf.as_mut_ptr();
+        self.find_fr.wFindWhatLen = self.find_buf.len() as WORD;
+        self.find_fr.lpstrReplaceWith = self.replace_buf.as_mut_ptr();
+        self.find_fr.wReplaceWithLen = self.replace_buf.len() as WORD;
+
+        self.find_is_replace = replace;
+        self.hwnd_find = unsafe {
+            if replace {
+                ReplaceTextA(&mut self.find_fr)
+            } else {
+                FindTextA(&mut self.find_fr)
+            }
+        };
+    }
+
+    fn do_find_next(&mut self, notify_not_found: bool) -> bool {
+        let needle_utf8 = self.find_what_str();
+        if needle_utf8.is_empty() {
+            self.open_find_dialog(false);
+            return false;
+        }
+        self.read_editor_to_utf8();
+        let hay = utf8_to_cp1252(&self.utf8_buf);
+        let ndl = utf8_to_cp1252(&needle_utf8);
+
+        let mut cr = CHARRANGE::default();
+        unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+        }
+        let down = (self.find_flags & FR_DOWN) != 0;
+        let match_case = (self.find_flags & FR_MATCHCASE) != 0;
+        let whole_word = (self.find_flags & FR_WHOLEWORD) != 0;
+        let start_pos = if down {
+            cr.cpMax.max(0) as usize
+        } else {
+            cr.cpMin.max(0) as usize
+        };
+
+        if let Some((m_start, m_end)) = find_cp1252(&hay, &ndl, start_pos, down, match_case, whole_word) {
+            let found = CHARRANGE {
+                cpMin: m_start as i32,
+                cpMax: m_end as i32,
+            };
+            unsafe {
+                SendMessageA(self.hwnd_edit, EM_EXSETSEL, 0, &found as *const _ as LPARAM);
+                SendMessageA(self.hwnd_edit, EM_SCROLLCARET, 0, 0);
+            }
+            self.update_status_bar();
+            true
+        } else {
+            if notify_not_found {
+                let owner = if !self.hwnd_find.is_null() {
+                    self.hwnd_find
+                } else {
+                    self.hwnd_main
+                };
+                let msg = cstr(&format!("Cannot find \"{}\".", needle_utf8));
+                let cap = cstr("md98");
+                unsafe {
+                    MessageBoxA(owner, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            false
+        }
+    }
+
+    fn do_replace_current(&mut self) {
+        let needle_utf8 = self.find_what_str();
+        if needle_utf8.is_empty() {
+            return;
+        }
+        let mut cr = CHARRANGE::default();
+        unsafe {
+            SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
+        }
+        let match_case = (self.find_flags & FR_MATCHCASE) != 0;
+        let whole_word = (self.find_flags & FR_WHOLEWORD) != 0;
+
+        let mut selection_matches = false;
+        if cr.cpMax > cr.cpMin {
+            self.read_editor_to_utf8();
+            let hay = utf8_to_cp1252(&self.utf8_buf);
+            let ndl = utf8_to_cp1252(&needle_utf8);
+            let s = cr.cpMin.max(0) as usize;
+            let e = cr.cpMax.max(0) as usize;
+            if e - s == ndl.len() && e <= hay.len() {
+                if let Some((ms, me)) = find_cp1252(&hay, &ndl, s, true, match_case, whole_word) {
+                    selection_matches = ms == s && me == e;
+                }
+            }
+        }
+
+        if selection_matches {
+            let repl_utf8 = self.replace_with_str();
+            let mut repl_ansi = utf8_to_cp1252(&normalize_to_crlf(&repl_utf8));
+            repl_ansi.push(0);
+            self.suppress_change = true;
+            unsafe {
+                SendMessageA(self.hwnd_edit, EM_REPLACESEL, 1, repl_ansi.as_ptr() as LPARAM);
+                SendMessageA(self.hwnd_edit, EM_SETMODIFY, 1, 0);
+            }
+            self.apply_editor_theme();
+            self.suppress_change = false;
+            self.modified = true;
+            self.replace_count += 1;
+            self.update_title();
+            self.relayout_preview_from_editor();
+        }
+        let _ = self.do_find_next(true);
+    }
+
+    fn do_replace_all(&mut self) {
+        let needle_utf8 = self.find_what_str();
+        if needle_utf8.is_empty() {
+            return;
+        }
+        let repl_utf8 = self.replace_with_str();
+        let match_case = (self.find_flags & FR_MATCHCASE) != 0;
+        let whole_word = (self.find_flags & FR_WHOLEWORD) != 0;
+
+        let first_line = unsafe { SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) } as i32;
+        self.read_editor_to_utf8();
+        let (new_utf8, count) =
+            replace_all_text(&self.utf8_buf, &needle_utf8, &repl_utf8, match_case, whole_word);
+
+        if count > 0 {
+            let crlf = normalize_to_crlf(&new_utf8);
+            let mut ansi = utf8_to_cp1252(&crlf);
+            ansi.push(0);
+            self.suppress_change = true;
+            unsafe {
+                SendMessageA(self.hwnd_edit, WM_SETTEXT, 0, ansi.as_ptr() as LPARAM);
+                SendMessageA(self.hwnd_edit, EM_SETMODIFY, 1, 0);
+            }
+            self.apply_editor_theme();
+            unsafe {
+                let cur_first = SendMessageA(self.hwnd_edit, EM_GETFIRSTVISIBLELINE, 0, 0) as i32;
+                if cur_first != first_line {
+                    SendMessageA(self.hwnd_edit, EM_LINESCROLL, 0, (first_line - cur_first) as LPARAM);
+                }
+            }
+            self.suppress_change = false;
+            self.modified = true;
+            self.replace_count += count;
+            self.update_title();
+            self.relayout_preview_from_editor();
+        }
+
+        let owner = if !self.hwnd_find.is_null() {
+            self.hwnd_find
+        } else {
+            self.hwnd_main
+        };
+        let msg = cstr(&format!("Replaced {} occurrence(s).", count));
+        let cap = cstr("md98");
+        unsafe {
+            MessageBoxA(owner, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
+        }
+    }
+
+    fn handle_find_replace_msg(&mut self) {
+        let flags = self.find_fr.Flags;
+        // Persist user's direction / match-case / whole-word preferences
+        self.find_flags = flags & (FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD);
+
+        if (flags & FR_DIALOGTERM) != 0 {
+            self.hwnd_find = ptr::null_mut();
+            unsafe {
+                SetFocus(self.hwnd_edit);
+            }
+            return;
+        }
+        if (flags & FR_FINDNEXT) != 0 {
+            let _ = self.do_find_next(true);
+        } else if (flags & FR_REPLACE) != 0 {
+            self.do_replace_current();
+        } else if (flags & FR_REPLACEALL) != 0 {
+            self.do_replace_all();
+        }
+    }
+
     fn update_title(&self) {
         let name = self.current_file.as_deref().unwrap_or("Untitled");
         let star = if self.modified { "*" } else { "" };
@@ -444,7 +1130,15 @@ impl AppState {
         let p0 = cstr(self.current_file.as_deref().unwrap_or("Ready"));
         let p1 = cstr(&format!("Ln {}, Col {}", ln, col));
         let p2 = cstr(&format!("{} bytes", self.utf8_buf.len()));
-        let p3 = cstr(&format!("Layout: {} ms", self.last_layout_ms));
+        let mut wrap_flags = String::new();
+        if self.live_wrap {
+            wrap_flags.push('L');
+        }
+        if self.reflow_on_save {
+            wrap_flags.push('S');
+        }
+        let wrap_label = format!("Wrap: {}{}", self.wrap_width, wrap_flags);
+        let p3 = cstr(&format!("{} | {} ms", wrap_label, self.last_layout_ms));
         let p4 = cstr(&format!("GDI: {}", self.gdi.stats.live_objects()));
 
         unsafe {
@@ -473,10 +1167,10 @@ impl AppState {
                 GetClientRect(self.hwnd_status, &mut src);
                 status_h = src.bottom - src.top;
                 let parts: [i32; 5] = [
-                    (total_w - 360).max(120),
-                    (total_w - 260).max(200),
-                    (total_w - 170).max(280),
-                    (total_w - 75).max(360),
+                    (total_w - 395).max(120),
+                    (total_w - 300).max(200),
+                    (total_w - 205).max(280),
+                    (total_w - 75).max(380),
                     -1,
                 ];
                 SendMessageA(self.hwnd_status, SB_SETPARTS, 5, parts.as_ptr() as LPARAM);
@@ -694,7 +1388,11 @@ impl AppState {
     }
 
     fn save_to_path(&mut self, path: &str) -> bool {
-        self.read_editor_to_utf8();
+        if self.reflow_on_save {
+            let _ = self.reflow_full_document();
+        } else {
+            self.read_editor_to_utf8();
+        }
         if write_file_bytes(path, self.utf8_buf.as_bytes()) {
             self.current_file = Some(path.to_string());
             self.modified = false;
@@ -806,7 +1504,7 @@ impl AppState {
             ViewMode::PreviewOnly => "preview",
         };
         let report = format!(
-            "source_bytes={}\nblocks={}\ndraw_ops={}\ncontent_height={}\nlayout_ms={}\ndark_mode={}\nview_mode={}\nedit_sel_min={}\nedit_first_line={}\npreview_scroll_y={}\ngdi_live_initial={}\ngdi_live_final={}\ngdi_delta={}\ngdi_created={}\ngdi_deleted={}\ngdi_live_dcs={}\npaint_count={}\nbackbuffer_reallocs={}\nstress_edits={}\nsave_test_bytes={}\nmem_load={}\ntotal_phys={}\navail_phys={}\n",
+            "source_bytes={}\nblocks={}\ndraw_ops={}\ncontent_height={}\nlayout_ms={}\ndark_mode={}\nview_mode={}\nsync_scroll={}\nwrap_width={}\nlive_wrap={}\nreflow_on_save={}\nsplit_pos={}\nreplace_count={}\nedit_sel_min={}\nedit_first_line={}\npreview_scroll_y={}\ngdi_live_initial={}\ngdi_live_final={}\ngdi_delta={}\ngdi_created={}\ngdi_deleted={}\ngdi_live_dcs={}\npaint_count={}\nbackbuffer_reallocs={}\nstress_edits={}\nsave_test_bytes={}\nmem_load={}\ntotal_phys={}\navail_phys={}\n",
             self.utf8_buf.len(),
             self.layout.blocks.len(),
             self.layout.ops.len(),
@@ -814,6 +1512,12 @@ impl AppState {
             self.last_layout_ms,
             if self.dark_mode { 1 } else { 0 },
             mode_str,
+            if self.sync_scroll { 1 } else { 0 },
+            self.wrap_width,
+            if self.live_wrap { 1 } else { 0 },
+            if self.reflow_on_save { 1 } else { 0 },
+            self.split_pos,
+            self.replace_count,
             cur_sel_min,
             cur_first_line,
             self.scroll_y,
@@ -849,7 +1553,7 @@ fn build_menu() -> HMENU {
         AppendMenuA(file, MF_STRING, IDM_FILE_SAVE, b"&Save\tCtrl+S\0".as_ptr());
         AppendMenuA(file, MF_STRING, IDM_FILE_SAVEAS, b"Save &As...\0".as_ptr());
         AppendMenuA(file, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuA(file, MF_STRING, IDM_FILE_EXIT, b"E&xit\0".as_ptr());
+        AppendMenuA(file, MF_STRING, IDM_FILE_EXIT, b"E&xit\tCtrl+Q\0".as_ptr());
         AppendMenuA(menu, MF_POPUP, file as usize, b"&File\0".as_ptr());
 
         let edit = CreatePopupMenu();
@@ -858,8 +1562,20 @@ fn build_menu() -> HMENU {
         AppendMenuA(edit, MF_STRING, IDM_EDIT_CUT, b"Cu&t\tCtrl+X\0".as_ptr());
         AppendMenuA(edit, MF_STRING, IDM_EDIT_COPY, b"&Copy\tCtrl+C\0".as_ptr());
         AppendMenuA(edit, MF_STRING, IDM_EDIT_PASTE, b"&Paste\tCtrl+V\0".as_ptr());
-        AppendMenuA(edit, MF_SEPARATOR, 0, ptr::null());
         AppendMenuA(edit, MF_STRING, IDM_EDIT_SELECTALL, b"Select &All\tCtrl+A\0".as_ptr());
+        AppendMenuA(edit, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuA(edit, MF_STRING, IDM_EDIT_FIND, b"&Find...\tCtrl+F\0".as_ptr());
+        AppendMenuA(edit, MF_STRING, IDM_EDIT_FINDNEXT, b"Find &Next\tF3\0".as_ptr());
+        AppendMenuA(edit, MF_STRING, IDM_EDIT_REPLACE, b"&Replace...\tCtrl+H\0".as_ptr());
+        AppendMenuA(edit, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuA(edit, MF_STRING, IDM_EDIT_REFLOW, b"Reflo&w Text\tCtrl+R\0".as_ptr());
+        AppendMenuA(edit, MF_STRING, IDM_EDIT_LIVEWRAP, b"&Live Auto-Wrap\0".as_ptr());
+        AppendMenuA(edit, MF_STRING, IDM_EDIT_REFLOW_ONSAVE, b"Reflow on Sa&ve\0".as_ptr());
+        let wrap_sub = CreatePopupMenu();
+        AppendMenuA(wrap_sub, MF_STRING, IDM_EDIT_WRAP_72, b"&72 Characters\0".as_ptr());
+        AppendMenuA(wrap_sub, MF_STRING | MF_CHECKED, IDM_EDIT_WRAP_80, b"&80 Characters\0".as_ptr());
+        AppendMenuA(wrap_sub, MF_STRING, IDM_EDIT_WRAP_100, b"&100 Characters\0".as_ptr());
+        AppendMenuA(edit, MF_POPUP, wrap_sub as usize, b"Wrap &Width\0".as_ptr());
         AppendMenuA(menu, MF_POPUP, edit as usize, b"&Edit\0".as_ptr());
 
         let view = CreatePopupMenu();
@@ -869,7 +1585,7 @@ fn build_menu() -> HMENU {
         AppendMenuA(view, MF_STRING, IDM_VIEW_TOGGLE_F11, b"&Toggle Preview/Editor\tF11\0".as_ptr());
         AppendMenuA(view, MF_SEPARATOR, 0, ptr::null());
         AppendMenuA(view, MF_STRING | MF_CHECKED, IDM_VIEW_SYNCSCROLL, b"Sync &Scroll\0".as_ptr());
-        AppendMenuA(view, MF_STRING, IDM_VIEW_DARKMODE, b"&Dark Mode\tCtrl+D\0".as_ptr());
+        AppendMenuA(view, MF_STRING, IDM_VIEW_DARKMODE, b"&Dark Mode\0".as_ptr());
         AppendMenuA(menu, MF_POPUP, view as usize, b"&View\0".as_ptr());
 
         let help = CreatePopupMenu();
@@ -891,6 +1607,11 @@ unsafe extern "system" fn preview_wnd_proc(
         return DefWindowProcA(hwnd, msg, wparam, lparam);
     }
     let st = &mut *state_ptr;
+
+    if st.msg_find_replace != 0 && msg == st.msg_find_replace {
+        st.handle_find_replace_msg();
+        return 0;
+    }
 
     match msg {
         WM_ERASEBKGND => 1, // Avoid flicker; WM_PAINT double-buffers entire viewport
@@ -1003,6 +1724,11 @@ unsafe extern "system" fn main_wnd_proc(
     }
     let st = &mut *state_ptr;
 
+    if st.msg_find_replace != 0 && msg == st.msg_find_replace {
+        st.handle_find_replace_msg();
+        return 0;
+    }
+
     match msg {
         WM_SIZE => {
             st.layout_children();
@@ -1059,6 +1785,7 @@ unsafe extern "system" fn main_wnd_proc(
             if st.dragging_splitter {
                 st.dragging_splitter = false;
                 ReleaseCapture();
+                st.save_prefs();
             }
             0
         }
@@ -1069,6 +1796,7 @@ unsafe extern "system" fn main_wnd_proc(
             if id == ID_EDIT {
                 if code == EN_CHANGE && !st.suppress_change {
                     if SendMessageA(st.hwnd_edit, EM_GETMODIFY, 0, 0) != 0 {
+                        st.maybe_live_wrap_current_line();
                         st.modified = true;
                         st.update_title();
                         SetTimer(hwnd, TIMER_DEBOUNCE, DEBOUNCE_MS, ptr::null_mut());
@@ -1115,6 +1843,33 @@ unsafe extern "system" fn main_wnd_proc(
                 IDM_EDIT_SELECTALL => {
                     SendMessageA(st.hwnd_edit, EM_SETSEL, 0, -1);
                 }
+                IDM_EDIT_FIND => {
+                    st.open_find_dialog(false);
+                }
+                IDM_EDIT_FINDNEXT => {
+                    let _ = st.do_find_next(true);
+                }
+                IDM_EDIT_REPLACE => {
+                    st.open_find_dialog(true);
+                }
+                IDM_EDIT_REFLOW => {
+                    st.reflow_editor_text();
+                }
+                IDM_EDIT_LIVEWRAP => {
+                    st.toggle_live_wrap();
+                }
+                IDM_EDIT_REFLOW_ONSAVE => {
+                    st.toggle_reflow_on_save();
+                }
+                IDM_EDIT_WRAP_72 => {
+                    st.set_wrap_width(72);
+                }
+                IDM_EDIT_WRAP_80 => {
+                    st.set_wrap_width(80);
+                }
+                IDM_EDIT_WRAP_100 => {
+                    st.set_wrap_width(100);
+                }
                 IDM_VIEW_SPLIT | IDM_VIEW_EDITOR | IDM_VIEW_PREVIEW => {
                     let target = match id {
                         IDM_VIEW_EDITOR => ViewMode::EditorOnly,
@@ -1136,6 +1891,7 @@ unsafe extern "system" fn main_wnd_proc(
                         IDM_VIEW_SYNCSCROLL as UINT,
                         MF_BYCOMMAND | if st.sync_scroll { MF_CHECKED } else { MF_UNCHECKED },
                     );
+                    st.save_prefs();
                 }
                 IDM_HELP_ABOUT => {
                     let msg = cstr("md98 - Native GFM Editor & Live Previewer for Windows 98 SE\r\nWritten in Rust (rust9x) for i586 Pentium+ (40 MB RAM).");
@@ -1316,7 +2072,16 @@ pub fn run() {
         SendMessageA(hwnd_edit, WM_SETFONT, gdi.editor_font as WPARAM, 1);
         SendMessageA(hwnd_edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SCROLL);
 
-        let start_dark = cli.dark_mode;
+        let msg_find_replace = RegisterWindowMessageA(b"commdlg_FindReplace\0".as_ptr());
+        let prefs = load_prefs_from_registry();
+        let start_dark = if cli.dark_mode { true } else { prefs.dark_mode };
+        let start_wrap_width = cli.wrap_width.unwrap_or(prefs.wrap_width);
+        let start_live_wrap = if cli.live_wrap { true } else { prefs.live_wrap };
+        let start_reflow_on_save = if cli.reflow_on_save {
+            true
+        } else {
+            prefs.reflow_on_save
+        };
         let mut state = Box::new(AppState {
             hwnd_main,
             hwnd_edit,
@@ -1325,6 +2090,16 @@ pub fn run() {
             hmenu,
             hcursor_sizewe,
             hriched_dll,
+            msg_find_replace,
+            hwnd_find: ptr::null_mut(),
+            find_is_replace: false,
+            find_fr: core::mem::zeroed(),
+            find_buf: [0u8; 256],
+            replace_buf: [0u8; 256],
+            find_flags: FR_DOWN,
+            wrap_width: start_wrap_width,
+            live_wrap: start_live_wrap,
+            reflow_on_save: start_reflow_on_save,
             gdi,
             backbuf: ViewportBackBuffer::new(),
             layout: DocumentLayout::new(),
@@ -1334,9 +2109,9 @@ pub fn run() {
             modified: false,
             suppress_change: false,
             dark_mode: start_dark,
-            view_mode: ViewMode::Split,
-            sync_scroll: true,
-            split_pos: 360,
+            view_mode: prefs.view_mode,
+            sync_scroll: prefs.sync_scroll,
+            split_pos: prefs.split_pos,
             dragging_splitter: false,
             splitter_rect: RECT::default(),
             saved_edit_sel: CHARRANGE::default(),
@@ -1351,15 +2126,14 @@ pub fn run() {
             gdi_live_initial: 0,
             stress_completed: 0,
             save_test_bytes: 0,
+            replace_count: 0,
         });
 
         let state_ptr = state.as_mut() as *mut AppState;
         SetWindowLongA(hwnd_main, GWL_USERDATA, state_ptr as isize);
         SetWindowLongA(hwnd_preview, GWL_USERDATA, state_ptr as isize);
 
-        if state.dark_mode {
-            CheckMenuItem(hmenu, IDM_VIEW_DARKMODE as UINT, MF_BYCOMMAND | MF_CHECKED);
-        }
+        state.sync_all_menu_checks();
 
         ShowWindow(hwnd_main, SW_MAXIMIZE);
         state.layout_children();
@@ -1375,7 +2149,11 @@ pub fn run() {
 
         UpdateWindow(hwnd_main);
         UpdateWindow(hwnd_preview);
-        SetFocus(hwnd_edit);
+        if state.view_mode == ViewMode::PreviewOnly {
+            SetFocus(hwnd_preview);
+        } else {
+            SetFocus(hwnd_edit);
+        }
 
         // Record baseline live GDI handles after initial layout & first paint
         state.gdi_live_initial = state.gdi.stats.live_objects();
@@ -1389,12 +2167,19 @@ pub fn run() {
 
         let mut msg: MSG = core::mem::zeroed();
         while GetMessageA(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+            if !state.hwnd_find.is_null() && IsDialogMessageA(state.hwnd_find, &msg) != 0 {
+                continue;
+            }
             if msg.message == WM_KEYDOWN {
                 if msg.wParam == VK_F11 {
                     PostMessageA(hwnd_main, WM_COMMAND, IDM_VIEW_TOGGLE_F11, 0);
                     continue;
                 }
-                // Simple keyboard shortcuts (Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+D)
+                if msg.wParam == VK_F3 {
+                    PostMessageA(hwnd_main, WM_COMMAND, IDM_EDIT_FINDNEXT, 0);
+                    continue;
+                }
+                // Simple keyboard shortcuts (Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Q, Ctrl+F, Ctrl+H, Ctrl+R)
                 if (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0 {
                     match msg.wParam as u8 {
                         b'N' => {
@@ -1409,8 +2194,20 @@ pub fn run() {
                             PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_SAVE, 0);
                             continue;
                         }
-                        b'D' => {
-                            PostMessageA(hwnd_main, WM_COMMAND, IDM_VIEW_DARKMODE, 0);
+                        b'Q' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_FILE_EXIT, 0);
+                            continue;
+                        }
+                        b'F' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_EDIT_FIND, 0);
+                            continue;
+                        }
+                        b'H' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_EDIT_REPLACE, 0);
+                            continue;
+                        }
+                        b'R' => {
+                            PostMessageA(hwnd_main, WM_COMMAND, IDM_EDIT_REFLOW, 0);
                             continue;
                         }
                         _ => {}

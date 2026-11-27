@@ -1,6 +1,6 @@
 //! Minimal Win32 ANSI (`*A`) FFI declarations restricted strictly to stock Windows 98 SE exports.
 //!
-//! Allowed DLLs: KERNEL32.DLL, USER32.DLL, GDI32.DLL, COMDLG32.DLL, COMCTL32.DLL, RICHED20.DLL.
+//! Allowed DLLs: KERNEL32.DLL, USER32.DLL, GDI32.DLL, ADVAPI32.DLL, COMDLG32.DLL, COMCTL32.DLL, RICHED20.DLL.
 
 #![cfg(windows)]
 #![allow(dead_code, non_snake_case, non_camel_case_types, clippy::upper_case_acronyms)]
@@ -20,6 +20,8 @@ pub type HMENU = *mut c_void;
 pub type HICON = *mut c_void;
 pub type HCURSOR = *mut c_void;
 pub type HANDLE = *mut c_void;
+pub type HKEY = *mut c_void;
+pub type LSTATUS = i32;
 pub type UINT = u32;
 pub type DWORD = u32;
 pub type WORD = u16;
@@ -95,8 +97,10 @@ pub const EM_GETFIRSTVISIBLELINE: UINT = 0x00CE;
 pub const EM_GETLINECOUNT: UINT = 0x00BA;
 pub const EM_LINEINDEX: UINT = 0x00BB;
 pub const EM_LINESCROLL: UINT = 0x00B6;
+pub const EM_SCROLLCARET: UINT = 0x00B7;
 pub const EM_GETMODIFY: UINT = 0x00B8;
 pub const EM_SETMODIFY: UINT = 0x00B9;
+pub const EM_REPLACESEL: UINT = 0x00C2;
 pub const EM_UNDO: UINT = 0x00C7;
 pub const WM_CUT: UINT = 0x0300;
 pub const WM_COPY: UINT = 0x0301;
@@ -106,6 +110,7 @@ pub const EM_EXGETSEL: UINT = WM_USER + 52;
 pub const EM_EXLIMITTEXT: UINT = WM_USER + 53;
 pub const EM_EXLINEFROMCHAR: UINT = WM_USER + 54;
 pub const EM_EXSETSEL: UINT = WM_USER + 55;
+pub const EM_GETSELTEXT: UINT = WM_USER + 62;
 pub const EM_SETBKGNDCOLOR: UINT = WM_USER + 67;
 pub const EM_SETCHARFORMAT: UINT = WM_USER + 68;
 pub const EM_SETEVENTMASK: UINT = WM_USER + 69;
@@ -195,12 +200,30 @@ pub const OFN_OVERWRITEPROMPT: DWORD = 0x0000_0002;
 pub const OFN_HIDEREADONLY: DWORD = 0x0000_0004;
 pub const ICC_BAR_CLASSES: DWORD = 0x0000_0004;
 
+// Find / Replace common dialog flags
+pub const FR_DOWN: DWORD = 0x0000_0001;
+pub const FR_WHOLEWORD: DWORD = 0x0000_0002;
+pub const FR_MATCHCASE: DWORD = 0x0000_0004;
+pub const FR_FINDNEXT: DWORD = 0x0000_0008;
+pub const FR_REPLACE: DWORD = 0x0000_0010;
+pub const FR_REPLACEALL: DWORD = 0x0000_0020;
+pub const FR_DIALOGTERM: DWORD = 0x0000_0040;
+
+// Registry constants (stock Win98 SE ADVAPI32.DLL)
+pub const HKEY_CURRENT_USER: HKEY = 0x8000_0001u32 as usize as HKEY;
+pub const KEY_READ: DWORD = 0x0002_0019;
+pub const KEY_WRITE: DWORD = 0x0002_0006;
+pub const REG_OPTION_NON_VOLATILE: DWORD = 0;
+pub const REG_DWORD: DWORD = 4;
+pub const ERROR_SUCCESS: LSTATUS = 0;
+
 // Virtual keys
 pub const VK_CONTROL: i32 = 0x11;
 pub const VK_PRIOR: usize = 0x21;
 pub const VK_NEXT: usize = 0x22;
 pub const VK_UP: usize = 0x26;
 pub const VK_DOWN: usize = 0x28;
+pub const VK_F3: usize = 0x72;
 pub const VK_F11: usize = 0x7A;
 
 #[repr(C)]
@@ -342,6 +365,22 @@ pub struct OPENFILENAMEA {
     pub lpTemplateName: *const u8,
 }
 
+/// Win98 SE-compatible `FINDREPLACEA` (40 bytes).
+#[repr(C)]
+pub struct FINDREPLACEA {
+    pub lStructSize: DWORD,
+    pub hwndOwner: HWND,
+    pub hInstance: HINSTANCE,
+    pub Flags: DWORD,
+    pub lpstrFindWhat: *mut u8,
+    pub lpstrReplaceWith: *mut u8,
+    pub wFindWhatLen: WORD,
+    pub wReplaceWithLen: WORD,
+    pub lCustData: LPARAM,
+    pub lpfnHook: *mut c_void,
+    pub lpTemplateName: *const u8,
+}
+
 #[repr(C)]
 pub struct MEMORYSTATUS {
     pub dwLength: DWORD,
@@ -445,6 +484,8 @@ extern "system" {
     pub fn MessageBoxA(hwnd: HWND, lpText: *const u8, lpCaption: *const u8, uType: UINT) -> i32;
     pub fn SetFocus(hwnd: HWND) -> HWND;
     pub fn GetKeyState(nVirtKey: i32) -> i16;
+    pub fn RegisterWindowMessageA(lpString: *const u8) -> UINT;
+    pub fn IsDialogMessageA(hDlg: HWND, lpMsg: *const MSG) -> BOOL;
 }
 
 #[link(name = "gdi32")]
@@ -490,11 +531,52 @@ extern "system" {
 extern "system" {
     pub fn GetOpenFileNameA(lpofn: *mut OPENFILENAMEA) -> BOOL;
     pub fn GetSaveFileNameA(lpofn: *mut OPENFILENAMEA) -> BOOL;
+    pub fn FindTextA(lpfr: *mut FINDREPLACEA) -> HWND;
+    pub fn ReplaceTextA(lpfr: *mut FINDREPLACEA) -> HWND;
 }
 
 #[link(name = "comctl32")]
 extern "system" {
     pub fn InitCommonControlsEx(lpInitCtrls: *const INITCOMMONCONTROLSEX) -> BOOL;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn RegCreateKeyExA(
+        hKey: HKEY,
+        lpSubKey: *const u8,
+        Reserved: DWORD,
+        lpClass: *const u8,
+        dwOptions: DWORD,
+        samDesired: DWORD,
+        lpSecurityAttributes: *mut c_void,
+        phkResult: *mut HKEY,
+        lpdwDisposition: *mut DWORD,
+    ) -> LSTATUS;
+    pub fn RegOpenKeyExA(
+        hKey: HKEY,
+        lpSubKey: *const u8,
+        ulOptions: DWORD,
+        samDesired: DWORD,
+        phkResult: *mut HKEY,
+    ) -> LSTATUS;
+    pub fn RegQueryValueExA(
+        hKey: HKEY,
+        lpValueName: *const u8,
+        lpReserved: *mut DWORD,
+        lpType: *mut DWORD,
+        lpData: *mut u8,
+        lpcbData: *mut DWORD,
+    ) -> LSTATUS;
+    pub fn RegSetValueExA(
+        hKey: HKEY,
+        lpValueName: *const u8,
+        Reserved: DWORD,
+        dwType: DWORD,
+        lpData: *const u8,
+        cbData: DWORD,
+    ) -> LSTATUS;
+    pub fn RegCloseKey(hKey: HKEY) -> LSTATUS;
 }
 
 #[inline]

@@ -2,6 +2,8 @@
 
 pub mod cp1252;
 pub mod layout;
+pub mod reflow;
+pub mod search;
 
 pub use cp1252::{cp1252_to_utf8, normalize_to_crlf, normalize_to_lf, utf8_to_cp1252, utf8_to_cp1252_into};
 pub use layout::{
@@ -11,6 +13,8 @@ pub use layout::{
     COLOR_QUOTE_BAR, COLOR_QUOTE_BG, COLOR_RULE, COLOR_TABLE_BORDER, COLOR_TABLE_HEADER_BG,
     COLOR_TABLE_STRIPE_BG, COLOR_TEXT,
 };
+pub use reflow::{compute_live_wrap_break, is_line_in_fenced_code, reflow_markdown, WRAP_WIDTHS};
+pub use search::{find_cp1252, replace_all_text};
 
 #[cfg(test)]
 mod tests {
@@ -240,6 +244,93 @@ mod tests {
         assert!(src > 0 && src < md.len());
         let mapped_y = doc.y_for_source_offset(src);
         assert!(mapped_y >= 0 && mapped_y <= doc.content_height);
+    }
+
+    #[test]
+    fn reflow_wraps_paragraphs_lists_quotes_and_preserves_code_and_tables() {
+        let md = "\
+# Long Heading That Should Never Be Reflowed Even If It Exceeds Seventy Two Characters Wide
+
+This is a very long paragraph written on a single line that definitely exceeds seventy two characters and should be wrapped cleanly at word boundaries.
+
+> Blockquote line that is also very long and needs to preserve the quote prefix on every single wrapped continuation line.
+
+- [x] Task list item with a long description that should wrap cleanly with a two-space hanging indent underneath.
+
+| Column One | Column Two | Column Three Which Is Very Wide And Must Not Be Broken |
+| :--- | :---: | ---: |
+| Value 1 | Value 2 | Value 3 |
+
+```rust
+let very_long_code_line_that_must_remain_completely_untouched_during_reflow = 1234567890;
+```
+";
+        let out72 = reflow_markdown(md, 72);
+        let lines: Vec<&str> = out72.lines().collect();
+        // Heading untouched
+        assert!(lines[0].starts_with("# Long Heading") && lines[0].len() > 72);
+        // Paragraph lines <= 72
+        let para_lines: Vec<&&str> = lines.iter().filter(|l| l.starts_with("This is") || l.starts_with("characters") || l.starts_with("boundaries")).collect();
+        assert!(para_lines.len() >= 2);
+        for l in &para_lines {
+            assert!(l.chars().count() <= 72, "Paragraph line exceeded 72: {l}");
+        }
+        // Blockquote preserves "> " prefix on continuation lines
+        let q_lines: Vec<&&str> = lines.iter().filter(|l| l.starts_with("> ")).collect();
+        assert!(q_lines.len() >= 2);
+        for l in &q_lines {
+            assert!(l.chars().count() <= 72, "Quote line exceeded 72: {l}");
+        }
+        // Task list item wraps with hanging indent
+        assert!(out72.contains("\n  "));
+        // Table & fenced code preserved verbatim
+        assert!(out72.contains("| Column One | Column Two | Column Three Which Is Very Wide And Must Not Be Broken |"));
+        assert!(out72.contains("let very_long_code_line_that_must_remain_completely_untouched_during_reflow = 1234567890;"));
+
+        // 80 and 100 column reflows also respect their widths
+        let out100 = reflow_markdown("word ".repeat(30).trim(), 100);
+        for l in out100.lines() {
+            assert!(l.chars().count() <= 100);
+        }
+    }
+
+    #[test]
+    fn live_wrap_breaks_regular_and_prefixed_lines_and_skips_code() {
+        let long_line = "This is a live typed sentence that just crossed the seventy two column mark cleanly";
+        let (idx, ins) = compute_live_wrap_break(long_line, 72, false).expect("should wrap");
+        assert!(idx <= 72);
+        assert_eq!(ins, "\r\n");
+
+        let quote_line = "> This is a live typed blockquote sentence that just crossed seventy two chars";
+        let (qidx, qins) = compute_live_wrap_break(quote_line, 72, false).expect("should wrap quote");
+        assert!(qidx <= 72);
+        assert_eq!(qins, "\r\n> ");
+
+        assert!(compute_live_wrap_break(long_line, 72, true).is_none());
+        assert!(compute_live_wrap_break("# Heading longer than seventy two characters should not live wrap at all here", 72, false).is_none());
+        assert!(is_line_in_fenced_code("```rust\nlet x = 1;\n", 1));
+        assert!(!is_line_in_fenced_code("```rust\nlet x = 1;\n```\nhello\n", 3));
+    }
+
+    #[test]
+    fn find_and_replace_case_whole_word_and_direction() {
+        let text = "Hello world, hello Win98! Hellos are nice.";
+        let hay = utf8_to_cp1252(text);
+        // Case-insensitive forward search
+        let m1 = find_cp1252(&hay, b"hello", 0, true, false, false).unwrap();
+        assert_eq!(&hay[m1.0..m1.1], b"Hello");
+        let m2 = find_cp1252(&hay, b"hello", m1.1, true, false, false).unwrap();
+        assert_eq!(&hay[m2.0..m2.1], b"hello");
+        // Whole word skips "Hellos"
+        let m3 = find_cp1252(&hay, b"hello", m2.1, true, false, true).unwrap();
+        assert_eq!(m3, m1, "Should wrap around to first whole-word match");
+        // Backward search
+        let mb = find_cp1252(&hay, b"hello", m2.0, false, false, true).unwrap();
+        assert_eq!(mb, m1);
+        // Replace All (whole-word, case-insensitive)
+        let (replaced, count) = replace_all_text(text, "hello", "hi", false, true);
+        assert_eq!(count, 2);
+        assert_eq!(replaced, "hi world, hi Win98! Hellos are nice.");
     }
 
     #[test]
