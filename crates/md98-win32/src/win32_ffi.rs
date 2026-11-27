@@ -119,8 +119,10 @@ pub const SCF_ALL: WPARAM = 0x0004;
 pub const CFM_COLOR: DWORD = 0x4000_0000;
 pub const ENM_CHANGE: LPARAM = 0x0000_0001;
 pub const ENM_SCROLL: LPARAM = 0x0000_0004;
+pub const ENM_SELCHANGE: LPARAM = 0x0008_0000;
 pub const EN_CHANGE: u16 = 0x0300;
 pub const EN_VSCROLL: u16 = 0x0602;
+pub const EN_SELCHANGE: UINT = 0x0702;
 
 // Status bar messages
 pub const SB_SETPARTS: UINT = WM_USER + 4;
@@ -162,8 +164,13 @@ pub const MF_CHECKED: UINT = 0x0008;
 pub const MF_UNCHECKED: UINT = 0x0000;
 pub const MF_BYCOMMAND: UINT = 0x0000;
 pub const MB_OK: UINT = 0x0000;
-pub const MB_ICONINFORMATION: UINT = 0x0040;
+pub const MB_YESNOCANCEL: UINT = 0x0003;
 pub const MB_ICONERROR: UINT = 0x0010;
+pub const MB_ICONQUESTION: UINT = 0x0020;
+pub const MB_ICONINFORMATION: UINT = 0x0040;
+pub const IDCANCEL: i32 = 2;
+pub const IDYES: i32 = 6;
+pub const IDNO: i32 = 7;
 
 // GDI constants
 pub const TRANSPARENT: i32 = 1;
@@ -317,6 +324,13 @@ pub struct LOGFONTA {
 pub struct CHARRANGE {
     pub cpMin: i32,
     pub cpMax: i32,
+}
+
+#[repr(C)]
+pub struct NMHDR {
+    pub hwndFrom: HWND,
+    pub idFrom: usize,
+    pub code: UINT,
 }
 
 /// Win98 SE-compatible `CHARFORMATA` (60 bytes) for `EM_SETCHARFORMAT`.

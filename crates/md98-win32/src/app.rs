@@ -256,6 +256,7 @@ struct AppState {
     current_file: Option<String>,
     modified: bool,
     suppress_change: bool,
+    headless_closing: bool,
 
     dark_mode: bool,
     view_mode: ViewMode,
@@ -1113,11 +1114,11 @@ impl AppState {
         }
     }
 
-    fn update_status_bar(&self) {
+    fn update_status_cursor_pos(&self) {
         if self.hwnd_status.is_null() {
             return;
         }
-        // Compute 1-based Ln / Col from RichEdit
+        // Compute 1-based Ln / Col directly from RichEdit (O(1), safe on every EN_SELCHANGE)
         let (ln, col) = unsafe {
             let mut cr = CHARRANGE { cpMin: 0, cpMax: 0 };
             SendMessageA(self.hwnd_edit, EM_EXGETSEL, 0, &mut cr as *mut _ as LPARAM);
@@ -1126,9 +1127,19 @@ impl AppState {
             let col = (cr.cpMin - line_start).max(0) + 1;
             (line + 1, col)
         };
+        let p1 = cstr(&format!("Ln {}, Col {}", ln, col));
+        unsafe {
+            SendMessageA(self.hwnd_status, SB_SETTEXTA, 1, p1.as_ptr() as LPARAM);
+        }
+    }
+
+    fn update_status_bar(&self) {
+        if self.hwnd_status.is_null() {
+            return;
+        }
+        self.update_status_cursor_pos();
 
         let p0 = cstr(self.current_file.as_deref().unwrap_or("Ready"));
-        let p1 = cstr(&format!("Ln {}, Col {}", ln, col));
         let p2 = cstr(&format!("{} bytes", self.utf8_buf.len()));
         let mut wrap_flags = String::new();
         if self.live_wrap {
@@ -1143,7 +1154,6 @@ impl AppState {
 
         unsafe {
             SendMessageA(self.hwnd_status, SB_SETTEXTA, 0, p0.as_ptr() as LPARAM);
-            SendMessageA(self.hwnd_status, SB_SETTEXTA, 1, p1.as_ptr() as LPARAM);
             SendMessageA(self.hwnd_status, SB_SETTEXTA, 2, p2.as_ptr() as LPARAM);
             SendMessageA(self.hwnd_status, SB_SETTEXTA, 3, p3.as_ptr() as LPARAM);
             SendMessageA(self.hwnd_status, SB_SETTEXTA, 4, p4.as_ptr() as LPARAM);
@@ -1431,7 +1441,7 @@ impl AppState {
         }
     }
 
-    fn save_as_dialog(&mut self) {
+    fn save_as_dialog(&mut self) -> bool {
         let mut file_buf = [0u8; 260];
         if let Some(cur) = &self.current_file {
             let bytes = utf8_to_cp1252(cur);
@@ -1451,7 +1461,56 @@ impl AppState {
         if unsafe { GetSaveFileNameA(&mut ofn) } != 0 {
             let len = file_buf.iter().position(|&b| b == 0).unwrap_or(0);
             let path = cp1252_to_utf8(&file_buf[..len]);
-            let _ = self.save_to_path(&path);
+            if self.save_to_path(&path) {
+                true
+            } else {
+                let msg = cstr("Failed to save file.");
+                let cap = cstr("md98");
+                unsafe {
+                    MessageBoxA(self.hwnd_main, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONERROR);
+                }
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Prompt the user to save unsaved changes before closing, creating a new file, or opening another file.
+    /// Returns `true` if it is safe to proceed, `false` if the user canceled or saving failed.
+    fn confirm_save_if_modified(&mut self) -> bool {
+        if !self.modified {
+            return true;
+        }
+        let name = self.current_file.as_deref().unwrap_or("Untitled");
+        let msg = cstr(&format!("Save changes to {}?", name));
+        let cap = cstr("md98");
+        let choice = unsafe {
+            MessageBoxA(
+                self.hwnd_main,
+                msg.as_ptr(),
+                cap.as_ptr(),
+                MB_YESNOCANCEL | MB_ICONQUESTION,
+            )
+        };
+        match choice {
+            IDYES => {
+                if let Some(path) = self.current_file.clone() {
+                    if self.save_to_path(&path) {
+                        true
+                    } else {
+                        let emsg = cstr("Failed to save file.");
+                        unsafe {
+                            MessageBoxA(self.hwnd_main, emsg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONERROR);
+                        }
+                        false
+                    }
+                } else {
+                    self.save_as_dialog()
+                }
+            }
+            IDNO => true,
+            _ => false,
         }
     }
 
@@ -1789,6 +1848,16 @@ unsafe extern "system" fn main_wnd_proc(
             }
             0
         }
+        WM_NOTIFY => {
+            let nmhdr = lparam as *const NMHDR;
+            if !nmhdr.is_null() {
+                let hdr = &*nmhdr;
+                if hdr.hwndFrom == st.hwnd_edit && hdr.code == EN_SELCHANGE {
+                    st.update_status_cursor_pos();
+                }
+            }
+            0
+        }
         WM_COMMAND => {
             let id = loword(wparam) as usize;
             let code = hiword(wparam);
@@ -1799,6 +1868,7 @@ unsafe extern "system" fn main_wnd_proc(
                         st.maybe_live_wrap_current_line();
                         st.modified = true;
                         st.update_title();
+                        st.update_status_cursor_pos();
                         SetTimer(hwnd, TIMER_DEBOUNCE, DEBOUNCE_MS, ptr::null_mut());
                     }
                     return 0;
@@ -1810,20 +1880,28 @@ unsafe extern "system" fn main_wnd_proc(
 
             match id {
                 IDM_FILE_NEW => {
-                    st.load_markdown_text("", None);
+                    if st.confirm_save_if_modified() {
+                        st.load_markdown_text("", None);
+                    }
                 }
                 IDM_FILE_OPEN => {
-                    st.open_dialog();
+                    if st.confirm_save_if_modified() {
+                        st.open_dialog();
+                    }
                 }
                 IDM_FILE_SAVE => {
                     if let Some(path) = st.current_file.clone() {
-                        let _ = st.save_to_path(&path);
+                        if !st.save_to_path(&path) {
+                            let msg = cstr("Failed to save file.");
+                            let cap = cstr("md98");
+                            MessageBoxA(hwnd, msg.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONERROR);
+                        }
                     } else {
-                        st.save_as_dialog();
+                        let _ = st.save_as_dialog();
                     }
                 }
                 IDM_FILE_SAVEAS => {
-                    st.save_as_dialog();
+                    let _ = st.save_as_dialog();
                 }
                 IDM_FILE_EXIT => {
                     PostMessageA(hwnd, WM_CLOSE, 0, 0);
@@ -1920,6 +1998,7 @@ unsafe extern "system" fn main_wnd_proc(
                 return 0;
             } else if wparam == TIMER_HEADLESS_EXIT {
                 KillTimer(hwnd, TIMER_HEADLESS_EXIT);
+                st.headless_closing = true;
                 st.dump_metrics_file();
                 PostMessageA(hwnd, WM_CLOSE, 0, 0);
                 return 0;
@@ -1935,6 +2014,9 @@ unsafe extern "system" fn main_wnd_proc(
             0
         }
         WM_CLOSE => {
+            if !st.headless_closing && !st.confirm_save_if_modified() {
+                return 0;
+            }
             st.dump_metrics_file();
             DestroyWindow(hwnd);
             0
@@ -2067,10 +2149,10 @@ pub fn run() {
         );
 
         let gdi = GdiCache::new();
-        // Configure RichEdit 2.0: 4 MB limit (no 64 KB cap!), monospace font, EN_CHANGE + EN_VSCROLL
+        // Configure RichEdit 2.0: 4 MB limit (no 64 KB cap!), monospace font, EN_CHANGE + EN_VSCROLL + EN_SELCHANGE
         SendMessageA(hwnd_edit, EM_EXLIMITTEXT, 0, (4 * 1024 * 1024) as LPARAM);
         SendMessageA(hwnd_edit, WM_SETFONT, gdi.editor_font as WPARAM, 1);
-        SendMessageA(hwnd_edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SCROLL);
+        SendMessageA(hwnd_edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SCROLL | ENM_SELCHANGE);
 
         let msg_find_replace = RegisterWindowMessageA(b"commdlg_FindReplace\0".as_ptr());
         let prefs = load_prefs_from_registry();
@@ -2108,6 +2190,7 @@ pub fn run() {
             current_file: None,
             modified: false,
             suppress_change: false,
+            headless_closing: false,
             dark_mode: start_dark,
             view_mode: prefs.view_mode,
             sync_scroll: prefs.sync_scroll,
