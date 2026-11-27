@@ -5,6 +5,12 @@ mod app;
 #[cfg(windows)]
 mod gdi;
 #[cfg(windows)]
+mod prefs;
+#[cfg(windows)]
+mod types;
+#[cfg(windows)]
+mod win32;
+#[cfg(windows)]
 mod win32_ffi;
 
 #[cfg(not(windows))]
